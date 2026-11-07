@@ -57,6 +57,8 @@ Open `/perfmon`, go to **Install**, and click **Install** next to an addon (or r
 
 To undo it, click **Remove** or run `/perfmon remove <addon>`.
 
+To do every loaded addon at once, click **Install all** / **Remove all** at the top of the Install tab (or run `/perfmon install all` / `/perfmon remove all`). Install all skips addons that are already instrumented, use perf manually, or whose file can't be found; Remove all only touches addons perfmon installed into. Each changed addon is reloaded.
+
 ### Option 2: by hand
 
 Same effect as the installer:
@@ -111,13 +113,14 @@ Set these on the table returned by `require('perf')`:
 
 ## The dashboard
 
-`/perfmon` toggles the window.
+`/perfmon` toggles the window. All three tables have sortable headers (click to sort, click again to flip) and resizable columns (drag the borders between headers).
 
 ### Stats tab
 
 - **Top line:** FPS, average and worst frame time, and hitches per second and total. Under it: game memory and any addons flagged for a leak.
 - **Graph:** frame time for the last 240 frames.
-- **Table:** addons sorted by main-thread time, each with its sections underneath. Click an addon's name to collapse or expand its sections (a collapsed addon shows its section count, and its totals stay visible). **Expand all** / **Collapse all** do every addon at once.
+- **Table:** addons with their sections underneath, sorted by main-thread time (ms/s) by default. Click any column header to sort by it (click again to flip direction); sections inside each addon follow the same sort. Click an addon's name to collapse or expand its sections (a collapsed addon shows its section count, and its totals stay visible). **Show all** / **Collapse all** do every addon at once.
+- **Right-click menu:** right-click anywhere in the table for **Show all**, **Collapse all**, and a **Sort by** submenu.
 
 | Column | Meaning |
 |---|---|
@@ -137,7 +140,7 @@ Uninstrumented addons are listed at the bottom.
 ### Memory tab
 
 - **Game process:** private memory, peak, trend in MB/min and a graph sampled every 10 s.
-- **Per addon:** current Lua memory, memory after GC, trend in KB/min, fit, status and a history graph.
+- **Per addon:** current Lua memory, memory after GC, trend in KB/min, fit, status and a history graph. Sorted by KB/min (fastest growing first) by default; click a header to sort by another column. Status sorts by severity (OVER CAP, LEAK?, growing, expected, stable, collecting).
 
 | Status | Meaning |
 |---|---|
@@ -151,7 +154,9 @@ Uninstrumented addons are listed at the bottom.
 
 ### Install tab
 
-Lists loaded addons with their instrumentation status (installed / manual / not installed / file not found), whether each is reporting, and Install / Remove buttons. Buttons in the window ask you to confirm first.
+Click the Addon, Status or Reporting header to sort by it (A-Z by default).
+
+Lists loaded addons with their instrumentation status (installed / manual / not installed / file not found), whether each is reporting, and Install / Remove buttons, plus **Install all** / **Remove all** buttons that show how many addons they'll change. Buttons in the window ask you to confirm first.
 
 ---
 
@@ -189,6 +194,8 @@ You get one chat message when something is first flagged. `/perfmon mem` prints 
 | `/perfmon mem` | Memory / leak summary to chat. |
 | `/perfmon install <addon>` | Instrument a loaded addon (backup + reload). |
 | `/perfmon remove <addon>` | Remove instrumentation (reload). |
+| `/perfmon install all` | Instrument every loaded addon that isn't already (backup + reload each). |
+| `/perfmon remove all` | Remove instrumentation from every addon perfmon installed into. |
 | `/perfmon status` | Show which loaded addons are instrumented. |
 | `/perfmon help` | List commands. |
 

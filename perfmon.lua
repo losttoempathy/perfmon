@@ -10,6 +10,8 @@
 *   /perfmon mem             Print memory / leak-check summary to chat.
 *   /perfmon install <addon> Add auto-instrumentation to a loaded addon (backup + reload).
 *   /perfmon remove <addon>  Take it back out and reload.
+*   /perfmon install all     Install into every loaded addon that isn't instrumented yet.
+*   /perfmon remove all      Remove from every addon perfmon installed into.
 *   /perfmon status          Show which loaded addons are instrumented.
 *   /perfmon help            Show commands.
 *
@@ -21,7 +23,7 @@
 
 addon.name    = 'perfmon';
 addon.author  = 'Lift';
-addon.version = '1.3';
+addon.version = '1.4';
 addon.desc    = 'Performance dashboard for addons that use libs/perf.lua.';
 addon.link    = '';
 
@@ -211,6 +213,13 @@ local pm = {
     others_at   = 0,
     -- Stats tab: addon name -> true when its sections are hidden
     collapsed = {},
+    -- Per-table sort state: col = column index, asc = ascending.
+    -- text = columns that start A-Z when picked (numbers start biggest first); nosort = not clickable.
+    sorts = {
+        stats = { col = 6, asc = false, def_col = 6, def_asc = false, text = { [1] = true } },
+        mem   = { col = 4, asc = false, def_col = 4, def_asc = false, text = { [1] = true }, nosort = { [7] = true } },
+        inst  = { col = 1, asc = true,  def_col = 1, def_asc = true,  text = { [1] = true, [2] = true }, nosort = { [4] = true } },
+    },
     -- game process memory
     proc = { kb = nil, peak = 0, at = 0, hist = {}, plot = {}, lo = 0, hi = 1, trend = nil, rising = false, warned = false },
 };
@@ -453,6 +462,52 @@ local COL_WARN  = { 1.0, 0.85, 0.3, 1.0 };
 local COL_BAD   = { 1.0, 0.4, 0.4, 1.0 };
 local COL_HEAD  = { 0.55, 0.8, 1.0, 1.0 };
 local COL_STALE = { 0.5, 0.5, 0.5, 1.0 };
+local COL_HDR   = { 0.85, 0.85, 0.85, 1.0 };
+
+-- All tables: resizable columns (drag the borders), striped rows, scrolling with a frozen header.
+local TABLE_FLAGS = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_Resizable,
+    ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
+
+-- Picks column i for a sort state (click again to flip direction).
+local function sort_pick(st, i)
+    if (st.col == i) then
+        st.asc = not st.asc;
+    else
+        st.col = i;
+        st.asc = (st.text ~= nil and st.text[i] == true);
+    end
+end
+
+--[[
+* Clickable header row, drawn by hand so sorting doesn't depend on the imgui binding's
+* sort-specs support. cols = list of header names, st = a pm.sorts entry.
+--]]
+local function draw_sort_headers(id, cols, st)
+    imgui.TableNextRow(ImGuiTableRowFlags_Headers or 1);
+    for i, name in ipairs(cols) do
+        imgui.TableNextColumn();
+        if (st.nosort ~= nil and st.nosort[i]) then
+            imgui.TextColored(COL_HDR, name);
+        else
+            local active = (st.col == i);
+            local label = name;
+            if (active) then label = label .. (st.asc and ' ^' or ' v'); end
+            imgui.PushStyleColor(ImGuiCol_Text, active and COL_HEAD or COL_HDR);
+            if (imgui.Selectable(label .. '##' .. id .. i, active)) then sort_pick(st, i); end
+            imgui.PopStyleColor();
+            if (imgui.IsItemHovered()) then
+                imgui.SetTooltip('Click to sort. Click again to flip. Drag column borders to resize.');
+            end
+        end
+    end
+end
+
+-- Compares two values for a sort state; tie-break on name keeps rows from jumping around.
+local function sort_cmp(st, xv, yv, xn, yn)
+    if (xv == yv) then return xn < yn; end
+    if (st.asc) then return xv < yv; end
+    return xv > yv;
+end
 
 --[[
 * Installer: adds / removes one marker line at the top of an addon's main .lua file.
@@ -468,7 +523,8 @@ local mgr = {
     loaded  = {},     -- sorted names of loaded addons (excluding perfmon)
     status  = {},     -- name -> 'auto' | 'manual' | 'none' | 'nofile'
     path    = {},     -- name -> resolved file path
-    pending = nil,    -- { action = 'install'|'remove', name = ... } awaiting confirm
+    rows    = {},     -- Install tab display order (reused each frame)
+    pending = nil,    -- { action = 'install'|'remove'|'install_all'|'remove_all', name = ... } awaiting confirm
     msg     = '',
     msg_col = nil,
 };
@@ -583,6 +639,7 @@ local function install(name)
     mgr.status[name] = 'auto';
     reload_addon(name);
     set_msg(('Installed into %s and reloaded it (backup: %s).'):fmt(name, bak), COL_OK);
+    return true;
 end
 
 local function remove(name)
@@ -614,6 +671,7 @@ local function remove(name)
     pm.addons[name] = nil;
     reload_addon(name);
     set_msg(('Removed from %s and reloaded it.'):fmt(name), COL_OK);
+    return true;
 end
 
 --[[
@@ -646,12 +704,60 @@ local function refresh_others(t, force)
     pm.others  = others;
 end
 
+-- Names of loaded addons a batch action would touch (install: 'none', remove: 'auto').
+local function batch_targets(action)
+    local want = (action == 'install') and 'none' or 'auto';
+    local out = {};
+    for _, n in ipairs(mgr.loaded) do
+        if (mgr.status[n] == want) then out[#out + 1] = n; end
+    end
+    return out;
+end
+
+-- Install into / remove from every eligible loaded addon. Manual and file-not-found addons are skipped.
+local function batch_apply(action)
+    mgr.status, mgr.path = {}, {};
+    refresh_others(now_us(), true);
+    local targets = batch_targets(action);
+    if (#targets == 0) then
+        return set_msg(action == 'install' and 'Nothing to install: every loaded addon is already instrumented or has no file.'
+            or 'Nothing to remove: perfmon is not installed in any loaded addon.', COL_WARN);
+    end
+    local ok_n, failed = 0, {};
+    for _, n in ipairs(targets) do
+        local ok = (action == 'install') and install(n) or remove(n);
+        if (ok) then ok_n = ok_n + 1; else failed[#failed + 1] = n; end
+    end
+    local verb = (action == 'install') and 'Installed into' or 'Removed from';
+    if (#failed == 0) then
+        set_msg(('%s %d addon(s) and reloaded them.'):fmt(verb, ok_n), COL_OK);
+    else
+        set_msg(('%s %d addon(s); failed: %s'):fmt(verb, ok_n, table.concat(failed, ', ')), COL_WARN);
+    end
+end
+
 local STATUS_TXT = {
     auto   = 'installed (auto)',
     manual = 'manual (in code)',
     none   = 'not installed',
     nofile = 'file not found',
 };
+
+local INST_COLS = { 'Addon', 'Status', 'Reporting', 'Action' };
+local INST_W    = { 1.8, 1.8, 1.0, 1.0 };
+
+local function cmp_inst(x, y)
+    local st = pm.sorts.inst;
+    local xv, yv;
+    if (st.col == 2) then
+        xv, yv = STATUS_TXT[mgr.status[x] or 'none'] or '', STATUS_TXT[mgr.status[y] or 'none'] or '';
+    elseif (st.col == 3) then
+        xv, yv = (pm.addons[x] ~= nil) and 1 or 0, (pm.addons[y] ~= nil) and 1 or 0;
+    else
+        xv, yv = x:lower(), y:lower();
+    end
+    return sort_cmp(st, xv, yv, x, y);
+end
 
 local function draw_installer()
     imgui.TextWrapped('Install adds one line to the top of the addon\'s main .lua file and reloads it. '
@@ -663,10 +769,20 @@ local function draw_installer()
 
     if (mgr.pending ~= nil) then
         local pd = mgr.pending;
-        imgui.TextColored(COL_WARN, ('%s %s? This edits %s'):fmt(pd.action == 'install' and 'Install into' or 'Remove from', pd.name, mgr.path[pd.name] or '?'));
+        if (pd.action == 'install_all' or pd.action == 'remove_all') then
+            local list = batch_targets(pd.action == 'install_all' and 'install' or 'remove');
+            imgui.TextColored(COL_WARN, ('%s %d addon(s)? This edits and reloads each one:'):fmt(
+                pd.action == 'install_all' and 'Install into' or 'Remove from', #list));
+            imgui.TextWrapped(table.concat(list, ', '));
+        else
+            imgui.TextColored(COL_WARN, ('%s %s? This edits %s'):fmt(pd.action == 'install' and 'Install into' or 'Remove from', pd.name, mgr.path[pd.name] or '?'));
+        end
         if (imgui.Button('Confirm')) then
             mgr.pending = nil;
-            if (pd.action == 'install') then install(pd.name); else remove(pd.name); end
+            if (pd.action == 'install') then install(pd.name);
+            elseif (pd.action == 'remove') then remove(pd.name);
+            elseif (pd.action == 'install_all') then batch_apply('install');
+            elseif (pd.action == 'remove_all') then batch_apply('remove'); end
         end
         imgui.SameLine();
         if (imgui.Button('Cancel')) then mgr.pending = nil; end
@@ -677,17 +793,38 @@ local function draw_installer()
         mgr.status, mgr.path = {}, {};
         refresh_others(now_us(), true);
     end
+    local n_inst, n_rem = #batch_targets('install'), #batch_targets('remove');
+    imgui.SameLine();
+    if (n_inst > 0) then
+        if (imgui.SmallButton(('Install all (%d)##pm_ia'):fmt(n_inst))) then
+            mgr.pending = { action = 'install_all' };
+        end
+    else
+        imgui.TextDisabled('Install all (0)');
+    end
+    imgui.SameLine();
+    if (n_rem > 0) then
+        if (imgui.SmallButton(('Remove all (%d)##pm_ra'):fmt(n_rem))) then
+            mgr.pending = { action = 'remove_all' };
+        end
+    else
+        imgui.TextDisabled('Remove all (0)');
+    end
 
-    local flags = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
-    if (imgui.BeginTable('##pm_inst', 4, flags, { 0, -1 })) then
+    -- Display order (mgr.loaded itself stays A-Z).
+    local rows = mgr.rows;
+    for i = #rows, 1, -1 do rows[i] = nil; end
+    for i, n in ipairs(mgr.loaded) do rows[i] = n; end
+    table.sort(rows, cmp_inst);
+
+    if (imgui.BeginTable('##pm_inst', 4, TABLE_FLAGS, { 0, -1 })) then
         imgui.TableSetupScrollFreeze(0, 1);
-        imgui.TableSetupColumn('Addon', ImGuiTableColumnFlags_WidthStretch, 2.0);
-        imgui.TableSetupColumn('Status', ImGuiTableColumnFlags_WidthStretch, 2.0);
-        imgui.TableSetupColumn('Reporting', ImGuiTableColumnFlags_WidthStretch, 1.0);
-        imgui.TableSetupColumn('Action', ImGuiTableColumnFlags_WidthStretch, 1.2);
-        imgui.TableHeadersRow();
+        for i, name in ipairs(INST_COLS) do
+            imgui.TableSetupColumn(name, ImGuiTableColumnFlags_WidthStretch, INST_W[i]);
+        end
+        draw_sort_headers('pm_ih', INST_COLS, pm.sorts.inst);
 
-        for _, n in ipairs(mgr.loaded) do
+        for _, n in ipairs(rows) do
             local st = mgr.status[n] or 'none';
             imgui.TableNextRow();
             imgui.TableNextColumn(); imgui.Text(n);
@@ -730,6 +867,97 @@ end
 local sorted = {};
 local NO_SECTIONS = {};   -- iterated when an addon is collapsed (avoids a new table per frame)
 
+--[[
+* Stats table sorting. Click a header to sort by it; click again to flip direction.
+* Addons are sorted by their totals, and each addon's sections by the same column.
+--]]
+local STAT_COLS = { 'Addon / section', 'Calls/s', 'Avg us', 'Max us', 'Peak us', 'ms/s', 'Mem KB' };
+local STAT_W    = { 2.6, 1.0, 1.0, 1.0, 1.0, 1.0, 1.6 };   -- starting widths (relative)
+
+-- Sort value of a section for a column. (Window scaling is per addon, so raw counts sort the same.)
+local function sec_key(s, col)
+    if (col == 2) then return s.n; end
+    if (col == 3) then return (s.n > 0) and (s.tot / s.n) or 0; end
+    if (col == 4) then return s.max; end
+    if (col == 5) then return s.peak; end
+    return s.tot;   -- ms/s, and Mem (sections have no memory of their own)
+end
+
+-- Sort value of an addon row: totals across its sections, per second.
+local function addon_key(a, col)
+    if (col == 7) then return a.mem or 0; end
+    if (col == 6) then return a.total_us / a.win_ms; end
+    local n, mx, pk = 0, 0, 0;
+    for _, s in pairs(a.sections) do
+        n = n + s.n;
+        if (s.max > mx) then mx = s.max; end
+        if (s.peak > pk) then pk = s.peak; end
+    end
+    if (col == 2) then return n / a.win_ms; end
+    if (col == 3) then return (n > 0) and (a.total_us / n) or 0; end
+    if (col == 4) then return mx; end
+    return pk;
+end
+
+local function cmp_addons(x, y)
+    local st = pm.sorts.stats;
+    if (st.col == 1) then
+        return sort_cmp(st, x.name:lower(), y.name:lower(), x.name, y.name);
+    end
+    return sort_cmp(st, addon_key(x, st.col), addon_key(y, st.col), x.name, y.name);
+end
+
+local sec_cmp_addon = nil;   -- addon whose sections are being sorted (avoids a closure per frame)
+local function cmp_sections(x, y)
+    local st = pm.sorts.stats;
+    if (st.col == 1) then
+        return sort_cmp(st, x:lower(), y:lower(), x, y);
+    end
+    local secs = sec_cmp_addon.sections;
+    return sort_cmp(st, sec_key(secs[x], st.col), sec_key(secs[y], st.col), x, y);
+end
+
+-- Returns the addon's section names in display order, reusing a per-addon array.
+local function sorted_sections(a)
+    local out = a.order_sorted;
+    if (out == nil) then out = {}; a.order_sorted = out; end
+    for i = #out, 1, -1 do out[i] = nil; end
+    for i, sname in ipairs(a.order) do out[i] = sname; end
+    sec_cmp_addon = a;
+    table.sort(out, cmp_sections);
+    sec_cmp_addon = nil;
+    return out;
+end
+
+local function show_all()
+    pm.collapsed = {};
+end
+
+local function collapse_all()
+    for n in pairs(pm.addons) do pm.collapsed[n] = true; end
+end
+
+-- Right-click menu for the Stats table.
+local function draw_stat_menu()
+    if (not imgui.BeginPopupContextWindow('##pm_stat_ctx', ImGuiPopupFlags_MouseButtonRight or 1)) then
+        return;
+    end
+    if (imgui.MenuItem('Show all')) then show_all(); end
+    if (imgui.MenuItem('Collapse all')) then collapse_all(); end
+    imgui.Separator();
+    if (imgui.BeginMenu('Sort by')) then
+        local st = pm.sorts.stats;
+        for i, name in ipairs(STAT_COLS) do
+            if (imgui.MenuItem(name, nil, st.col == i)) then sort_pick(st, i); end
+        end
+        imgui.Separator();
+        if (imgui.MenuItem('Ascending', nil, st.asc)) then st.asc = not st.asc; end
+        if (imgui.MenuItem('Default (ms/s, highest first)')) then st.col, st.asc = st.def_col, st.def_asc; end
+        imgui.EndMenu();
+    end
+    imgui.EndPopup();
+end
+
 local function addon_status(a)
     if (a.base == nil) then
         return 'waiting (or old perf.lua)', COL_STALE;
@@ -743,6 +971,37 @@ local function addon_status(a)
     if (a.expected) then return 'expected', COL_HEAD; end
     if (a.growing) then return 'growing', COL_WARN; end
     return 'stable', COL_OK;
+end
+
+local MEM_COLS = { 'Addon', 'Now KB', 'After GC KB', 'KB/min', 'Fit', 'Status', 'After-GC history' };
+local MEM_W    = { 1.6, 1.0, 1.2, 1.0, 0.8, 1.5, 2.2 };
+
+-- Status column sorts by severity (worst = biggest), not alphabetically.
+local function mem_status_rank(a)
+    if (a.base == nil) then return 0; end
+    local n = a.trend and a.trend.n or #a.base_hist;
+    if (n < LEAK_MIN_N) then return 1; end
+    if (a.over_cap) then return 6; end
+    if (a.leak) then return 5; end
+    if (a.growing) then return 4; end
+    if (a.expected) then return 3; end
+    return 2;
+end
+
+local function mem_key(a, col)
+    if (col == 2) then return a.mem or 0; end
+    if (col == 3) then return a.base or -math.huge; end
+    if (col == 4) then return a.trend and a.trend.slope or -math.huge; end
+    if (col == 5) then return a.trend and a.trend.r2 or -math.huge; end
+    return mem_status_rank(a);
+end
+
+local function cmp_mem(x, y)
+    local st = pm.sorts.mem;
+    if (st.col == 1) then
+        return sort_cmp(st, x.name:lower(), y.name:lower(), x.name, y.name);
+    end
+    return sort_cmp(st, mem_key(x, st.col), mem_key(y, st.col), x.name, y.name);
 end
 
 local function draw_memory()
@@ -777,23 +1036,14 @@ local function draw_memory()
     -- Per-addon Lua baselines
     for i = #sorted, 1, -1 do sorted[i] = nil; end
     for _, a in pairs(pm.addons) do sorted[#sorted + 1] = a; end
-    table.sort(sorted, function (x, y)
-        local sx = x.trend and x.trend.slope or -math.huge;
-        local sy = y.trend and y.trend.slope or -math.huge;
-        return sx > sy;
-    end);
+    table.sort(sorted, cmp_mem);
 
-    local flags = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
-    if (imgui.BeginTable('##pm_mem', 7, flags, { 0, -60 })) then
+    if (imgui.BeginTable('##pm_mem', 7, TABLE_FLAGS, { 0, -60 })) then
         imgui.TableSetupScrollFreeze(0, 1);
-        imgui.TableSetupColumn('Addon', ImGuiTableColumnFlags_WidthStretch, 2.0);
-        imgui.TableSetupColumn('Now KB');
-        imgui.TableSetupColumn('After GC KB');
-        imgui.TableSetupColumn('KB/min');
-        imgui.TableSetupColumn('Fit');
-        imgui.TableSetupColumn('Status', ImGuiTableColumnFlags_WidthStretch, 1.5);
-        imgui.TableSetupColumn('After-GC history', ImGuiTableColumnFlags_WidthStretch, 2.5);
-        imgui.TableHeadersRow();
+        for i, name in ipairs(MEM_COLS) do
+            imgui.TableSetupColumn(name, ImGuiTableColumnFlags_WidthStretch, MEM_W[i]);
+        end
+        draw_sort_headers('pm_mh', MEM_COLS, pm.sorts.mem);
 
         for _, a in ipairs(sorted) do
             local st, scol = addon_status(a);
@@ -883,35 +1133,26 @@ local function draw()
             pm.proc.peak = pm.proc.kb or 0;
         end
         imgui.SameLine();
-        if (imgui.SmallButton('Expand all')) then
-            pm.collapsed = {};
-        end
+        if (imgui.SmallButton('Show all')) then show_all(); end
         imgui.SameLine();
-        if (imgui.SmallButton('Collapse all')) then
-            for n in pairs(pm.addons) do pm.collapsed[n] = true; end
-        end
+        if (imgui.SmallButton('Collapse all')) then collapse_all(); end
         imgui.SameLine();
         imgui.TextDisabled(('perfmon self: %.3f ms/s'):fmt(pm.self_last / 1000));
 
         imgui.Separator();
 
-        -- Sort addons by main-thread time used.
+        -- Sort addons by the chosen column (default: main-thread time used).
         for i = #sorted, 1, -1 do sorted[i] = nil; end
         for _, a in pairs(pm.addons) do sorted[#sorted + 1] = a; end
-        table.sort(sorted, function (x, y) return x.total_us > y.total_us; end);
+        table.sort(sorted, cmp_addons);
 
         local t = now_us();
-        local flags = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
-        if (imgui.BeginTable('##pm_tbl', 7, flags, { 0, -60 })) then
+        if (imgui.BeginTable('##pm_tbl', 7, TABLE_FLAGS, { 0, -60 })) then
             imgui.TableSetupScrollFreeze(0, 1);
-            imgui.TableSetupColumn('Addon / section', ImGuiTableColumnFlags_WidthStretch, 3.0);
-            imgui.TableSetupColumn('Calls/s');
-            imgui.TableSetupColumn('Avg us');
-            imgui.TableSetupColumn('Max us');
-            imgui.TableSetupColumn('Peak us');
-            imgui.TableSetupColumn('ms/s');
-            imgui.TableSetupColumn('Mem KB');
-            imgui.TableHeadersRow();
+            for i, name in ipairs(STAT_COLS) do
+                imgui.TableSetupColumn(name, ImGuiTableColumnFlags_WidthStretch, STAT_W[i]);
+            end
+            draw_sort_headers('pm_sh', STAT_COLS, pm.sorts.stats);
 
             for _, a in ipairs(sorted) do
                 local stale = (t - a.seen) > STALE_US;
@@ -952,7 +1193,7 @@ local function draw()
                     imgui.Text(('%d (pk %d)'):fmt(a.mem, a.mem_peak));
                 end
 
-                for _, sname in ipairs(open and a.order or NO_SECTIONS) do
+                for _, sname in ipairs(open and sorted_sections(a) or NO_SECTIONS) do
                     local s = a.sections[sname];
                     local avg = (s.n > 0) and (s.tot / s.n) or 0;
                     imgui.TableNextRow();
@@ -965,6 +1206,7 @@ local function draw()
                     imgui.TableNextColumn();
                 end
             end
+            draw_stat_menu();
             imgui.EndTable();
         end
 
@@ -1031,6 +1273,8 @@ local function print_help()
     print('[perfmon] /perfmon mem - memory / leak-check summary to chat');
     print('[perfmon] /perfmon install <addon> - add auto-instrumentation to a loaded addon (edits its .lua, makes .perfbak backup, reloads it)');
     print('[perfmon] /perfmon remove <addon> - take it back out and reload');
+    print('[perfmon] /perfmon install all - install into every loaded addon that is not instrumented yet');
+    print('[perfmon] /perfmon remove all - remove from every addon perfmon installed into');
     print('[perfmon] /perfmon status - show which loaded addons are instrumented');
 end
 
@@ -1075,6 +1319,10 @@ ashita.events.register('command', 'perfmon_command', function (e)
     elseif (sub == 'install' or sub == 'remove') then
         if (args[3] == nil) then
             print(('[perfmon] usage: /perfmon %s <addon>'):fmt(sub));
+            return;
+        end
+        if (args[3]:lower() == 'all' and find_loaded('all') == nil) then
+            batch_apply(sub);
             return;
         end
         refresh_others(now_us(), true);
