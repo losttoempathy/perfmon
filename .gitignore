@@ -1,0 +1,8 @@
+# Backups made by perfmon's installer and by hand
+*.perfbak
+*.leakbak
+*.dbgbak
+*.bak
+
+# CSV logs, if one ever lands here
+*.csv

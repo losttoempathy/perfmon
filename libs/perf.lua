@@ -7,7 +7,8 @@
 * What it does:
 *   - Times your event callbacks / functions with the high-resolution counter (microseconds).
 *   - Keeps rolling 1-second stats (calls, avg, max) plus an all-time peak per section.
-*   - Tracks this addon's Lua memory (KB).
+*   - Tracks this addon's Lua memory (KB), plus a post-GC "baseline" once a minute for leak
+*     detection (perfmon watches the baseline's trend and flags steady growth).
 *   - Optional per-addon ImGui panel:  /perf <addonname>
 *   - If the 'perfmon' addon is loaded, sends a 1-second summary to it so you can see every
 *     instrumented addon in one dashboard.
@@ -28,6 +29,13 @@ local perf = {
     order       = {},       -- section names in creation order
     mem_kb      = 0,
     mem_peak_kb = 0,
+    -- Leak check: every gc_interval_s a full garbage collection runs and the memory left
+    -- afterwards is the baseline. A leak shows up as a baseline that keeps rising.
+    -- Set gc_interval_s = 0 to skip the forced GC (baseline = lowest reading in each minute;
+    -- cheaper, but less accurate for addons that allocate little).
+    gc_interval_s = 60,
+    mem_base_kb = nil,
+    base_fresh  = false,
     show        = { false },
     seq         = 0,
 };
@@ -38,7 +46,7 @@ local perf = {
 --]]
 local now_us;
 do
-    local ok = pcall(ffi.cdef, [[
+    pcall(ffi.cdef, [[
         int QueryPerformanceCounter(int64_t* lpPerformanceCount);
         int QueryPerformanceFrequency(int64_t* lpFrequency);
     ]]);
@@ -62,7 +70,6 @@ do
             return ashita.time.qpc().q * scale;
         end;
     end
-    local _ = ok;
 end
 perf.now_us = now_us;
 
@@ -204,6 +211,10 @@ local function send_report(win_ms)
     local name = clean(addon.name);
     perf.seq = (perf.seq % 100000) + 1;
     local head = ('/perfmon_rpt %s %d %d %d '):fmt(name, perf.seq, math.floor(perf.mem_kb), math.floor(win_ms));
+    if (perf.base_fresh and perf.mem_base_kb ~= nil) then
+        head = head .. ('b%d '):fmt(math.floor(perf.mem_base_kb));
+        perf.base_fresh = false;
+    end
 
     local buf = head;
     local sent = false;
@@ -228,6 +239,45 @@ end
 --]]
 local last_roll = now_us();
 local self_sec  = get_section('(perf)');
+local gc_sec    = get_section('(perf:gc)');
+
+--[[
+* Leak baseline. Returns the microseconds spent in a forced GC (0 if none).
+* The first sample is staggered 10-30s after load so addons loaded together
+* don't all collect on the same frame.
+--]]
+local next_base = nil;
+local trough    = math.huge;
+
+local function sample_baseline(t)
+    local forced = (perf.gc_interval_s ~= nil and perf.gc_interval_s > 0);
+    if (not forced and perf.mem_kb < trough) then
+        trough = perf.mem_kb;
+    end
+    if (next_base == nil) then
+        next_base = t + (10000 + (math.floor(t / 1000) % 20000)) * 1000;
+        return 0;
+    end
+    if (t < next_base) then
+        return 0;
+    end
+    next_base = t + (forced and perf.gc_interval_s or 60) * 1000000;
+
+    local gc_us = 0;
+    if (forced) then
+        local g0 = now_us();
+        collectgarbage('collect');
+        gc_us = now_us() - g0;
+        record(gc_sec, gc_us);
+        perf.mem_kb = collectgarbage('count');
+        perf.mem_base_kb = perf.mem_kb;
+    else
+        perf.mem_base_kb = (trough < math.huge) and trough or perf.mem_kb;
+        trough = math.huge;
+    end
+    perf.base_fresh = true;
+    return gc_us;
+end
 
 local function roll()
     local t = now_us();
@@ -246,12 +296,13 @@ local function roll()
 
     perf.mem_kb = collectgarbage('count');
     if (perf.mem_kb > perf.mem_peak_kb) then perf.mem_peak_kb = perf.mem_kb; end
+    local gc_us = sample_baseline(t);
 
     if (perf.report and perfmon_loaded()) then
         send_report(win);
     end
 
-    record(self_sec, now_us() - t);
+    record(self_sec, now_us() - t - gc_us);
 end
 
 --[[
@@ -272,7 +323,11 @@ local function draw_panel()
 
     imgui.SetNextWindowSize({ 520, 0 }, ImGuiCond_FirstUseEver);
     if (imgui.Begin(('perf - %s'):fmt(addon.name), perf.show, ImGuiWindowFlags_NoSavedSettings)) then
-        imgui.Text(('Lua memory: %.0f KB  (peak %.0f KB)'):fmt(perf.mem_kb, perf.mem_peak_kb));
+        if (perf.mem_base_kb ~= nil) then
+            imgui.Text(('Lua memory: %.0f KB  (peak %.0f KB, after GC %.0f KB)'):fmt(perf.mem_kb, perf.mem_peak_kb, perf.mem_base_kb));
+        else
+            imgui.Text(('Lua memory: %.0f KB  (peak %.0f KB)'):fmt(perf.mem_kb, perf.mem_peak_kb));
+        end
         imgui.SameLine();
         if (imgui.SmallButton('Reset')) then perf.reset(); end
         imgui.SameLine();
@@ -310,7 +365,8 @@ end
 * Prints a one-shot summary to chat.
 --]]
 function perf.print()
-    print(('[perf:%s] mem %.0f KB (peak %.0f KB)'):fmt(addon.name, perf.mem_kb, perf.mem_peak_kb));
+    print(('[perf:%s] mem %.0f KB (peak %.0f KB, after GC %s KB)'):fmt(addon.name, perf.mem_kb, perf.mem_peak_kb,
+        perf.mem_base_kb and ('%.0f'):fmt(perf.mem_base_kb) or '?'));
     for _, n in ipairs(perf.order) do
         local s = perf.sections[n];
         local avg = (s.l_n > 0) and (s.l_tot / s.l_n) or 0;

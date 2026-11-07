@@ -5,14 +5,23 @@
 *   /perfmon                 Toggle the dashboard window.
 *   /perfmon log [on|off]    Toggle CSV logging (config/addons/perfmon/perf_YYYYMMDD_HHMMSS.csv).
 *   /perfmon log clear       Empty the current CSV (keeps the header; logging continues).
-*   /perfmon reset           Clear peaks and frame stats.
+*   /perfmon reset           Clear all collected data.
 *   /perfmon print           Print a summary to chat.
+*   /perfmon mem             Print memory / leak-check summary to chat.
+*   /perfmon install <addon> Add auto-instrumentation to a loaded addon (backup + reload).
+*   /perfmon remove <addon>  Take it back out and reload.
+*   /perfmon status          Show which loaded addons are instrumented.
 *   /perfmon help            Show commands.
+*
+* Leak check: perf.lua sends a post-GC Lua memory baseline once a minute. perfmon fits a line
+* through the last 10 minutes of baselines and flags an addon whose baseline rises steadily.
+* It also samples the game process's private memory, which catches native leaks (FFI
+* allocations, textures, handles) that Lua memory can't see.
 --]]
 
 addon.name    = 'perfmon';
 addon.author  = 'Lift';
-addon.version = '1.0';
+addon.version = '1.2';
 addon.desc    = 'Performance dashboard for addons that use libs/perf.lua.';
 addon.link    = '';
 
@@ -52,6 +61,126 @@ local HITCH_MS     = 50;      -- a frame longer than this counts as a hitch
 local FLUSH_US     = 10000000;
 local CSV_HEADER   = 'time,addon,section,calls,avg_us,max_us,ms_per_s,mem_kb';
 
+-- Leak detection
+local LEAK_WINDOW_US = 10 * 60 * 1000000; -- trend is fitted over this much history
+local LEAK_KEEP_US   = 30 * 60 * 1000000; -- history kept for the graphs
+local LEAK_MIN_N     = 5;                 -- baselines needed before judging an addon (~5 min)
+local LEAK_KB_MIN    = 20;                -- addon baseline growth that counts as a leak (KB/min)...
+local LEAK_MIN_RISE  = 100;               -- ...with at least this much total growth (KB)...
+local LEAK_R2        = 0.85;              -- ...and steady growth (line fit 0..1), not one jump
+local PROC_SAMPLE_US = 10 * 1000000;      -- game process memory sample interval
+local PROC_MIN_N     = 12;                -- samples needed (~2 min)
+local PROC_MB_MIN    = 2;                 -- game process growth worth flagging (MB/min)
+
+--[[
+* Game process private memory (KB), via K32GetProcessMemoryInfo / psapi. nil if unavailable.
+--]]
+local proc_mem_kb = function () return nil; end;
+do
+    pcall(ffi.cdef, [[
+        typedef struct {
+            uint32_t cb;
+            uint32_t PageFaultCount;
+            size_t   PeakWorkingSetSize;
+            size_t   WorkingSetSize;
+            size_t   QuotaPeakPagedPoolUsage;
+            size_t   QuotaPagedPoolUsage;
+            size_t   QuotaPeakNonPagedPoolUsage;
+            size_t   QuotaNonPagedPoolUsage;
+            size_t   PagefileUsage;
+            size_t   PeakPagefileUsage;
+        } PM_PROCESS_MEMORY_COUNTERS;
+        void* __stdcall GetCurrentProcess(void);
+        int   __stdcall K32GetProcessMemoryInfo(void* Process, PM_PROCESS_MEMORY_COUNTERS* ppsmemCounters, uint32_t cb);
+        int   __stdcall GetProcessMemoryInfo(void* Process, PM_PROCESS_MEMORY_COUNTERS* ppsmemCounters, uint32_t cb);
+    ]]);
+    local ok, pmc = pcall(ffi.new, 'PM_PROCESS_MEMORY_COUNTERS');
+    if (ok and pmc ~= nil) then
+        local sz = ffi.sizeof(pmc);
+        pmc.cb = sz;
+        local function find(lib, fname)
+            local ok2, f = pcall(function () return lib[fname]; end);
+            if (ok2 and f ~= nil) then return f; end
+            return nil;
+        end
+        local psapi = nil;
+        local getinfo = find(ffi.C, 'K32GetProcessMemoryInfo');
+        if (getinfo == nil) then
+            local okl, lib = pcall(ffi.load, 'psapi');
+            if (okl) then
+                psapi = lib;
+                getinfo = find(psapi, 'GetProcessMemoryInfo');
+            end
+        end
+        if (getinfo ~= nil) then
+            local fn = function ()
+                local _ = psapi; -- keep the library loaded
+                if (getinfo(ffi.C.GetCurrentProcess(), pmc, sz) ~= 0) then
+                    return tonumber(pmc.PagefileUsage) / 1024;
+                end
+                return nil;
+            end;
+            local okc, v = pcall(fn);
+            if (okc and v ~= nil and v > 0) then
+                proc_mem_kb = fn;
+            end
+        end
+    end
+end
+
+--[[
+* History + trend helpers. hist = { {t=us, v=value}, ... } oldest first.
+--]]
+local function push_hist(hist, t, v)
+    hist[#hist + 1] = { t = t, v = v };
+    while (#hist > 0 and (t - hist[1].t) > LEAK_KEEP_US) do
+        table.remove(hist, 1);
+    end
+end
+
+-- Least-squares line over the samples inside LEAK_WINDOW_US.
+-- Returns { slope = units/min, r2 = 0..1, rise = last - first, n = samples, mins = span } or nil.
+local function trend(hist, now)
+    local n, sx, sy, sxx, sxy, syy = 0, 0, 0, 0, 0, 0;
+    local t0, v0, x, y;
+    for i = 1, #hist do
+        local h = hist[i];
+        if ((now - h.t) <= LEAK_WINDOW_US) then
+            if (t0 == nil) then t0, v0 = h.t, h.v; end
+            x = (h.t - t0) / 60000000;
+            y = h.v - v0;
+            n, sx, sy = n + 1, sx + x, sy + y;
+            sxx, sxy, syy = sxx + x * x, sxy + x * y, syy + y * y;
+        end
+    end
+    if (n < 2) then return nil; end
+    local dx = n * sxx - sx * sx;
+    if (dx <= 0) then return nil; end
+    local cov = n * sxy - sx * sy;
+    local dy  = n * syy - sy * sy;
+    return {
+        slope = cov / dx,
+        r2    = (dy > 0) and ((cov * cov) / (dx * dy)) or 0,
+        rise  = y,
+        n     = n,
+        mins  = x,
+    };
+end
+
+local function build_plot(hist, plot)
+    for i = #plot, 1, -1 do plot[i] = nil; end
+    local lo, hi = math.huge, -math.huge;
+    for i = 1, #hist do
+        local v = hist[i].v;
+        plot[i] = v;
+        if (v < lo) then lo = v; end
+        if (v > hi) then hi = v; end
+    end
+    if (#hist == 0) then return 0, 1; end
+    local pad = math.max((hi - lo) * 0.1, 1);
+    return lo - pad, hi + pad;
+end
+
 local pm = {
     show      = { true },
     addons    = {},           -- name -> entry
@@ -80,6 +209,10 @@ local pm = {
     -- uninstrumented list cache
     others      = {},
     others_at   = 0,
+    -- Stats tab: addon name -> true when its sections are hidden
+    collapsed = {},
+    -- game process memory
+    proc = { kb = nil, peak = 0, at = 0, hist = {}, plot = {}, lo = 0, hi = 1, trend = nil, rising = false, warned = false },
 };
 
 for i = 1, FRAME_RING do
@@ -94,7 +227,8 @@ end
 local function get_addon(name)
     local a = pm.addons[name];
     if (a == nil) then
-        a = { name = name, seq = -1, mem = 0, mem_peak = 0, win_ms = 1000, seen = 0, sections = {}, order = {}, total_us = 0 };
+        a = { name = name, seq = -1, mem = 0, mem_peak = 0, win_ms = 1000, seen = 0, sections = {}, order = {}, total_us = 0,
+              base = nil, base_hist = {}, base_plot = {}, lo = 0, hi = 1, trend = nil, leak = false, growing = false };
         pm.addons[name] = a;
     end
     return a;
@@ -106,6 +240,18 @@ local function log_line(str)
     end
 end
 
+local function judge_addon(a, now)
+    local tr = trend(a.base_hist, now);
+    a.trend = tr;
+    local was = a.leak;
+    a.leak = (tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN and tr.rise >= LEAK_MIN_RISE and tr.r2 >= LEAK_R2);
+    a.growing = (not a.leak) and tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN / 4 and tr.r2 >= LEAK_R2;
+    a.lo, a.hi = build_plot(a.base_hist, a.base_plot);
+    if (a.leak and not was) then
+        print(('[perfmon] possible leak in %s: Lua memory after GC rising %.0f KB/min (+%.0f KB over %.0f min).'):fmt(a.name, tr.slope, tr.rise, tr.mins));
+    end
+end
+
 local function handle_report(cmd)
     local name, seq, mem, win, payload = cmd:match('^/perfmon_rpt%s+(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s*(.*)$');
     if (name == nil) then
@@ -113,17 +259,34 @@ local function handle_report(cmd)
     end
     seq, mem, win = tonumber(seq), tonumber(mem), tonumber(win);
 
+    -- Optional post-GC baseline:  b<kb>  before the sections (sent ~once a minute).
+    local base = nil;
+    local b, rest = payload:match('^b(%d+)%s+(.*)$');
+    if (b ~= nil) then
+        base, payload = tonumber(b), rest;
+    end
+
     local a = get_addon(name);
 
     -- A new seq means a new 1s window; continuation chunks share the same seq.
     if (seq ~= a.seq) then
+        -- seq restarts at 1 when the addon reloads: its old memory history no longer applies.
+        if (seq < a.seq) then
+            a.base_hist, a.base_plot, a.base, a.trend, a.leak, a.growing = {}, {}, nil, nil, false, false;
+        end
+        if (base ~= nil) then
+            local t = now_us();
+            a.base = base;
+            push_hist(a.base_hist, t, base);
+            judge_addon(a, t);
+            log_line(('%s,%s,(gc baseline),0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), name, base));
+        end
         a.seq      = seq;
         a.mem      = mem;
         a.win_ms   = (win > 0) and win or 1000;
         a.seen     = now_us();
         a.total_us = 0;
         if (mem > a.mem_peak) then a.mem_peak = mem; end
-        for _, s in pairs(a.sections) do s.fresh = false; end
     end
 
     for sname, n, tot, mx in payload:gmatch('([^|;]+)|(%d+)|(%d+)|(%d+);') do
@@ -134,7 +297,7 @@ local function handle_report(cmd)
             a.sections[sname] = s;
             a.order[#a.order + 1] = sname;
         end
-        s.n, s.tot, s.max, s.fresh = n, tot, mx, true;
+        s.n, s.tot, s.max = n, tot, mx;
         if (mx > s.peak) then s.peak = mx; end
         a.total_us = a.total_us + tot;
 
@@ -232,6 +395,35 @@ local function frame_tick(t)
         pm.sec_start, pm.sec_frames, pm.sec_sum_ms, pm.sec_worst, pm.hitches = t, 0, 0, 0, 0;
         pm.self_last, pm.self_tot = pm.self_tot, 0;
     end
+end
+
+--[[
+* Game process memory sampling
+--]]
+local function proc_tick(t)
+    local p = pm.proc;
+    if ((t - p.at) < PROC_SAMPLE_US) then
+        return;
+    end
+    p.at = t;
+    local kb = proc_mem_kb();
+    if (kb == nil) then
+        return;
+    end
+    p.kb = kb;
+    if (kb > p.peak) then p.peak = kb; end
+    push_hist(p.hist, t, kb / 1024);   -- history in MB
+    p.trend = trend(p.hist, t);
+    local tr = p.trend;
+    p.rising = (tr ~= nil and tr.n >= PROC_MIN_N and tr.slope >= PROC_MB_MIN and tr.r2 >= LEAK_R2);
+    p.lo, p.hi = build_plot(p.hist, p.plot);
+    if (p.rising and not p.warned) then
+        p.warned = true;
+        print(('[perfmon] game process memory rising %.1f MB/min (+%.0f MB over %.0f min). See the Memory tab.'):fmt(tr.slope, tr.rise, tr.mins));
+    elseif (not p.rising) then
+        p.warned = false;
+    end
+    log_line(('%s,(game),process_private,0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), math.floor(kb)));
 end
 
 local COL_OK    = { 0.6, 1.0, 0.6, 1.0 };
@@ -514,6 +706,93 @@ local function heat_mss(ms)  -- ms of main-thread time per second
 end
 
 local sorted = {};
+local NO_SECTIONS = {};   -- iterated when an addon is collapsed (avoids a new table per frame)
+
+local function addon_status(a)
+    if (a.base == nil) then
+        return 'waiting (or old perf.lua)', COL_STALE;
+    end
+    local n = a.trend and a.trend.n or #a.base_hist;
+    if (n < LEAK_MIN_N) then
+        return ('collecting %d/%d'):fmt(n, LEAK_MIN_N), COL_STALE;
+    end
+    if (a.leak) then return 'LEAK?', COL_BAD; end
+    if (a.growing) then return 'growing', COL_WARN; end
+    return 'stable', COL_OK;
+end
+
+local function draw_memory()
+    local p = pm.proc;
+    local any_leak = false;
+    for _, a in pairs(pm.addons) do
+        if (a.leak) then any_leak = true; end
+    end
+
+    -- Game process
+    if (p.kb == nil) then
+        imgui.TextDisabled('Game process memory: not available on this system.');
+    else
+        local tr = p.trend;
+        local col = p.rising and COL_BAD or COL_HEAD;
+        if (tr ~= nil) then
+            imgui.TextColored(col, ('Game process: %.0f MB private (peak %.0f MB)   trend %+.2f MB/min  fit %.2f  over %.0f min'):fmt(
+                p.kb / 1024, p.peak / 1024, tr.slope, tr.r2, tr.mins));
+        else
+            imgui.TextColored(col, ('Game process: %.0f MB private (peak %.0f MB)   collecting...'):fmt(p.kb / 1024, p.peak / 1024));
+        end
+        if (#p.plot >= 2) then
+            imgui.PlotLines('##pm_proc', p.plot, #p.plot, 0, 'process MB (every 10s)', p.lo, p.hi, { -1, 50 });
+        end
+        if (p.rising and not any_leak) then
+            imgui.TextColored(COL_WARN, 'Process memory is rising but no addon\'s Lua memory is. Likely native: FFI allocations, textures/fonts not released, or the game itself (zoning also loads data).');
+        end
+    end
+
+    imgui.Separator();
+
+    -- Per-addon Lua baselines
+    for i = #sorted, 1, -1 do sorted[i] = nil; end
+    for _, a in pairs(pm.addons) do sorted[#sorted + 1] = a; end
+    table.sort(sorted, function (x, y)
+        local sx = x.trend and x.trend.slope or -math.huge;
+        local sy = y.trend and y.trend.slope or -math.huge;
+        return sx > sy;
+    end);
+
+    local flags = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
+    if (imgui.BeginTable('##pm_mem', 7, flags, { 0, -40 })) then
+        imgui.TableSetupScrollFreeze(0, 1);
+        imgui.TableSetupColumn('Addon', ImGuiTableColumnFlags_WidthStretch, 2.0);
+        imgui.TableSetupColumn('Now KB');
+        imgui.TableSetupColumn('After GC KB');
+        imgui.TableSetupColumn('KB/min');
+        imgui.TableSetupColumn('Fit');
+        imgui.TableSetupColumn('Status', ImGuiTableColumnFlags_WidthStretch, 1.5);
+        imgui.TableSetupColumn('After-GC history', ImGuiTableColumnFlags_WidthStretch, 2.5);
+        imgui.TableHeadersRow();
+
+        for _, a in ipairs(sorted) do
+            local st, scol = addon_status(a);
+            local tr = a.trend;
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.Text(a.name);
+            imgui.TableNextColumn(); imgui.Text(('%d'):fmt(a.mem));
+            imgui.TableNextColumn(); imgui.Text(a.base and ('%d'):fmt(a.base) or '-');
+            imgui.TableNextColumn();
+            if (tr ~= nil) then imgui.TextColored(scol, ('%+.1f'):fmt(tr.slope)); else imgui.TextDisabled('-'); end
+            imgui.TableNextColumn();
+            if (tr ~= nil) then imgui.Text(('%.2f'):fmt(tr.r2)); else imgui.TextDisabled('-'); end
+            imgui.TableNextColumn(); imgui.TextColored(scol, st);
+            imgui.TableNextColumn();
+            if (#a.base_plot >= 2) then
+                imgui.PlotLines('##pm_b_' .. a.name, a.base_plot, #a.base_plot, 0, '', a.lo, a.hi, { -1, 18 });
+            end
+        end
+        imgui.EndTable();
+    end
+    imgui.TextDisabled(('Flags an addon when its after-GC memory grows >= %d KB/min (and +%d KB) steadily (fit >= %.1f) over %d min. Fit near 1 = straight-line growth.'):fmt(
+        LEAK_KB_MIN, LEAK_MIN_RISE, LEAK_R2, LEAK_WINDOW_US / 60000000));
+end
 
 local function draw()
     if (not pm.show[1]) then
@@ -526,6 +805,17 @@ local function draw()
         -- Frame summary
         imgui.Text(('FPS %.1f   frame avg %.2f ms   worst %.1f ms   hitches(>%dms) %d/s (%d total)'):fmt(
             pm.fps, pm.avg_ms, pm.worst_ms, HITCH_MS, pm.last_hitches or 0, pm.hitch_total));
+        if (pm.proc.kb ~= nil) then
+            local ptr = pm.proc.trend;
+            imgui.TextColored(pm.proc.rising and COL_BAD or COL_HEAD, ('Game memory %.0f MB%s'):fmt(pm.proc.kb / 1024,
+                (ptr ~= nil and ptr.n >= PROC_MIN_N) and ('  (%+.2f MB/min)'):fmt(ptr.slope) or ''));
+            local leaks = 0;
+            for _, a in pairs(pm.addons) do if (a.leak) then leaks = leaks + 1; end end
+            if (leaks > 0) then
+                imgui.SameLine();
+                imgui.TextColored(COL_BAD, ('  %d addon(s) flagged for a possible leak - see Memory tab'):fmt(leaks));
+            end
+        end
 
         -- Copy ring into a linear, oldest-first array for the plot (no allocation).
         local idx = pm.ring_head;
@@ -560,6 +850,15 @@ local function draw()
                 for _, s in pairs(a.sections) do s.peak = s.max; end
             end
             pm.hitch_total = 0;
+            pm.proc.peak = pm.proc.kb or 0;
+        end
+        imgui.SameLine();
+        if (imgui.SmallButton('Expand all')) then
+            pm.collapsed = {};
+        end
+        imgui.SameLine();
+        if (imgui.SmallButton('Collapse all')) then
+            for n in pairs(pm.addons) do pm.collapsed[n] = true; end
         end
         imgui.SameLine();
         imgui.TextDisabled(('perfmon self: %.3f ms/s'):fmt(pm.self_last / 1000));
@@ -589,21 +888,45 @@ local function draw()
                 local scale = 1000 / a.win_ms;
                 local mss = a.total_us / 1000 * scale;
 
+                -- Addon row: click the name (or arrow) to show/hide its sections.
+                -- '###' keeps the node's ID fixed while the label text changes.
+                local hidden = pm.collapsed[a.name] == true;
+                local label = a.name;
+                if (stale) then label = label .. ' (no report)'; end
+                if (hidden) then label = ('%s  [%d]'):fmt(label, #a.order); end
                 imgui.TableNextRow();
                 imgui.TableNextColumn();
-                imgui.TextColored(stale and COL_STALE or COL_HEAD, stale and (a.name .. ' (no report)') or a.name);
+                imgui.PushStyleColor(ImGuiCol_Text, stale and COL_STALE or COL_HEAD);
+                local open;
+                if (imgui.SetNextItemOpen ~= nil) then
+                    imgui.SetNextItemOpen(not hidden);
+                    open = imgui.TreeNodeEx(label .. '###pm_a_' .. a.name, ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                else
+                    -- Older binding: a clickable row with a +/- marker instead of a tree arrow.
+                    open = not hidden;
+                    if (imgui.Selectable((open and '[-] ' or '[+] ') .. label .. '###pm_a_' .. a.name, false)) then
+                        open = not open;
+                    end
+                end
+                imgui.PopStyleColor();
+                pm.collapsed[a.name] = (not open) or nil;
                 imgui.TableNextColumn();
                 imgui.TableNextColumn();
                 imgui.TableNextColumn();
                 imgui.TableNextColumn();
                 imgui.TableNextColumn(); imgui.TextColored(stale and COL_STALE or heat_mss(mss), ('%.3f'):fmt(mss));
-                imgui.TableNextColumn(); imgui.Text(('%d (pk %d)'):fmt(a.mem, a.mem_peak));
+                imgui.TableNextColumn();
+                if (a.leak) then
+                    imgui.TextColored(COL_BAD, ('%d LEAK?'):fmt(a.mem));
+                else
+                    imgui.Text(('%d (pk %d)'):fmt(a.mem, a.mem_peak));
+                end
 
-                for _, sname in ipairs(a.order) do
+                for _, sname in ipairs(open and a.order or NO_SECTIONS) do
                     local s = a.sections[sname];
                     local avg = (s.n > 0) and (s.tot / s.n) or 0;
                     imgui.TableNextRow();
-                    imgui.TableNextColumn(); imgui.Text('   ' .. sname);
+                    imgui.TableNextColumn(); imgui.Text('      ' .. sname);
                     imgui.TableNextColumn(); imgui.Text(('%.0f'):fmt(s.n * scale));
                     imgui.TableNextColumn(); imgui.Text(('%.1f'):fmt(avg));
                     imgui.TableNextColumn(); imgui.TextColored(heat_us(s.max), ('%d'):fmt(s.max));
@@ -623,6 +946,10 @@ local function draw()
         end
         imgui.EndTabItem();
       end
+      if (imgui.BeginTabItem('Memory')) then
+          draw_memory();
+          imgui.EndTabItem();
+      end
       if (imgui.BeginTabItem('Install')) then
           draw_installer();
           imgui.EndTabItem();
@@ -639,12 +966,29 @@ local function print_summary()
     print(('[perfmon] FPS %.1f  avg %.2f ms  worst %.1f ms  hitches %d total'):fmt(pm.fps, pm.avg_ms, pm.worst_ms, pm.hitch_total));
     for _, a in pairs(pm.addons) do
         local scale = 1000 / a.win_ms;
-        print(('  %s: %.3f ms/s, mem %d KB (peak %d)'):fmt(a.name, a.total_us / 1000 * scale, a.mem, a.mem_peak));
+        print(('  %s: %.3f ms/s, mem %d KB (peak %d)%s'):fmt(a.name, a.total_us / 1000 * scale, a.mem, a.mem_peak, a.leak and '  POSSIBLE LEAK' or ''));
         for _, sname in ipairs(a.order) do
             local s = a.sections[sname];
             local avg = (s.n > 0) and (s.tot / s.n) or 0;
             print(('    %-20s %5.0f/s  avg %7.1fus  max %6dus  peak %6dus'):fmt(sname, s.n * scale, avg, s.max, s.peak));
         end
+    end
+end
+
+local function print_mem()
+    local p = pm.proc;
+    if (p.kb ~= nil) then
+        local tr = p.trend;
+        print(('[perfmon] game process %.0f MB private (peak %.0f MB)%s'):fmt(p.kb / 1024, p.peak / 1024,
+            tr and ('  %+.2f MB/min, fit %.2f over %.0f min%s'):fmt(tr.slope, tr.r2, tr.mins, p.rising and '  RISING' or '') or ''));
+    else
+        print('[perfmon] game process memory not available.');
+    end
+    for _, a in pairs(pm.addons) do
+        local st = addon_status(a);
+        local tr = a.trend;
+        print(('  %-16s now %6d KB  after GC %6s KB  %s  %s'):fmt(a.name, a.mem, a.base and tostring(a.base) or '-',
+            tr and ('%+.1f KB/min (fit %.2f)'):fmt(tr.slope, tr.r2) or '', st));
     end
 end
 
@@ -654,6 +998,7 @@ local function print_help()
     print('[perfmon] /perfmon log clear - empty the current CSV (keeps header)');
     print('[perfmon] /perfmon reset - clear all collected data');
     print('[perfmon] /perfmon print - summary to chat');
+    print('[perfmon] /perfmon mem - memory / leak-check summary to chat');
     print('[perfmon] /perfmon install <addon> - add auto-instrumentation to a loaded addon (edits its .lua, makes .perfbak backup, reloads it)');
     print('[perfmon] /perfmon remove <addon> - take it back out and reload');
     print('[perfmon] /perfmon status - show which loaded addons are instrumented');
@@ -690,9 +1035,13 @@ ashita.events.register('command', 'perfmon_command', function (e)
     elseif (sub == 'reset') then
         pm.addons = {};
         pm.hitch_total = 0;
+        pm.proc.hist, pm.proc.plot, pm.proc.trend, pm.proc.rising, pm.proc.warned = {}, {}, nil, false, false;
+        pm.proc.peak = pm.proc.kb or 0;
         print('[perfmon] reset.');
     elseif (sub == 'print') then
         print_summary();
+    elseif (sub == 'mem' or sub == 'leak' or sub == 'leaks') then
+        print_mem();
     elseif (sub == 'install' or sub == 'remove') then
         if (args[3] == nil) then
             print(('[perfmon] usage: /perfmon %s <addon>'):fmt(sub));
@@ -719,6 +1068,7 @@ end);
 ashita.events.register('d3d_present', 'perfmon_present', function ()
     local t = now_us();
     frame_tick(t);
+    proc_tick(t);
     refresh_others(t);
     draw();
 
