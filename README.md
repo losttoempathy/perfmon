@@ -84,6 +84,16 @@ table.sort(list, cmp);
 perf.stop('sort');
 ```
 
+### Growth that's on purpose
+
+Some addons are *supposed* to grow, such as a session log that's cleared on zone or a cache with a size cap. Tell perfmon so it doesn't call it a leak:
+
+```lua
+pcall(function () require('perf').expect_growth('session log, cleared on zone', 81920); end);
+```
+
+The first argument is a short note shown on the Memory tab. The second is an optional cap in KB. While the addon grows below the cap, its status is **expected**. If its after-GC memory ever passes the cap, it's flagged **OVER CAP**, so a cap that stops working is still caught. The `pcall` keeps the addon working on machines without `perf.lua`.
+
 Addons that `require('perf')` themselves show as **manual (in code)** on the Install tab. Edit those by hand.
 
 ### perf.lua settings
@@ -136,6 +146,8 @@ Uninstrumented addons are listed at the bottom.
 | stable | Not growing. |
 | growing | Rising steadily, but slower than the leak threshold. Worth watching. |
 | **LEAK?** | Rising steadily at or above the threshold. |
+| expected | Rising, but the addon declared that growth with `perf.expect_growth`. Hover to see its note. |
+| **OVER CAP** | The addon declared expected growth, but its after-GC memory passed the cap it gave. |
 
 ### Install tab
 

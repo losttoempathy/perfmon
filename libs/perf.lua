@@ -36,6 +36,8 @@ local perf = {
     gc_interval_s = 60,
     mem_base_kb = nil,
     base_fresh  = false,
+    growth_note = nil,      -- set by perf.expect_growth
+    growth_max  = 0,
     show        = { false },
     seq         = 0,
 };
@@ -182,6 +184,19 @@ function perf.stop(name)
 end
 
 --[[
+* Declares that this addon's memory grows on purpose (a session log, a cache that is
+* cleared on zone, ...). perfmon then shows it as "expected" with this note instead of
+* flagging a leak. If max_kb is given and the after-GC memory goes past it, perfmon
+* flags it anyway, so a cap that stops working is still caught.
+*     require('perf').expect_growth('session log, cleared on zone', 80000);
+--]]
+function perf.expect_growth(note, max_kb)
+    perf.growth_note = tostring(note or 'expected');
+    perf.growth_max  = math.max(0, math.floor(tonumber(max_kb) or 0));
+    perf.base_fresh  = (perf.mem_base_kb ~= nil);   -- send it with the next report
+end
+
+--[[
 * Resets all collected stats.
 --]]
 function perf.reset()
@@ -213,6 +228,9 @@ local function send_report(win_ms)
     local head = ('/perfmon_rpt %s %d %d %d '):fmt(name, perf.seq, math.floor(perf.mem_kb), math.floor(win_ms));
     if (perf.base_fresh and perf.mem_base_kb ~= nil) then
         head = head .. ('b%d '):fmt(math.floor(perf.mem_base_kb));
+        if (perf.growth_note ~= nil) then
+            head = head .. ('e%d:%s '):fmt(perf.growth_max, clean(perf.growth_note):sub(1, 60));
+        end
         perf.base_fresh = false;
     end
 

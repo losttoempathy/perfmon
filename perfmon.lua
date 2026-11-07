@@ -21,7 +21,7 @@
 
 addon.name    = 'perfmon';
 addon.author  = 'Lift';
-addon.version = '1.2';
+addon.version = '1.3';
 addon.desc    = 'Performance dashboard for addons that use libs/perf.lua.';
 addon.link    = '';
 
@@ -244,11 +244,24 @@ local function judge_addon(a, now)
     local tr = trend(a.base_hist, now);
     a.trend = tr;
     local was = a.leak;
-    a.leak = (tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN and tr.rise >= LEAK_MIN_RISE and tr.r2 >= LEAK_R2);
-    a.growing = (not a.leak) and tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN / 4 and tr.r2 >= LEAK_R2;
+    local looks_leak = (tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN and tr.rise >= LEAK_MIN_RISE and tr.r2 >= LEAK_R2);
+    -- Addons that declared expected growth (perf.expect_growth) are only flagged past their cap.
+    a.over_cap = (a.expect_note ~= nil and a.expect_max ~= nil and a.expect_max > 0 and a.base ~= nil and a.base > a.expect_max);
+    if (a.expect_note ~= nil) then
+        a.leak     = a.over_cap;
+        a.expected = (not a.over_cap) and looks_leak;
+    else
+        a.leak     = looks_leak;
+        a.expected = false;
+    end
+    a.growing = (not a.leak) and (not a.expected) and tr ~= nil and tr.n >= LEAK_MIN_N and tr.slope >= LEAK_KB_MIN / 4 and tr.r2 >= LEAK_R2;
     a.lo, a.hi = build_plot(a.base_hist, a.base_plot);
     if (a.leak and not was) then
-        print(('[perfmon] possible leak in %s: Lua memory after GC rising %.0f KB/min (+%.0f KB over %.0f min).'):fmt(a.name, tr.slope, tr.rise, tr.mins));
+        if (a.over_cap) then
+            print(('[perfmon] %s is past its declared memory cap: %d KB after GC (cap %d KB, "%s").'):fmt(a.name, a.base, a.expect_max, a.expect_note));
+        else
+            print(('[perfmon] possible leak in %s: Lua memory after GC rising %.0f KB/min (+%.0f KB over %.0f min).'):fmt(a.name, tr.slope, tr.rise, tr.mins));
+        end
     end
 end
 
@@ -260,10 +273,15 @@ local function handle_report(cmd)
     seq, mem, win = tonumber(seq), tonumber(mem), tonumber(win);
 
     -- Optional post-GC baseline:  b<kb>  before the sections (sent ~once a minute).
-    local base = nil;
+    -- Optional expected-growth note:  e<max_kb>:<note>  right after the baseline.
+    local base, exp_max, exp_note = nil, nil, nil;
     local b, rest = payload:match('^b(%d+)%s+(.*)$');
     if (b ~= nil) then
         base, payload = tonumber(b), rest;
+        local em, en, rest2 = payload:match('^e(%d+):(%S+)%s+(.*)$');
+        if (em ~= nil) then
+            exp_max, exp_note, payload = tonumber(em), en:gsub('_+', ' '), rest2;
+        end
     end
 
     local a = get_addon(name);
@@ -273,10 +291,14 @@ local function handle_report(cmd)
         -- seq restarts at 1 when the addon reloads: its old memory history no longer applies.
         if (seq < a.seq) then
             a.base_hist, a.base_plot, a.base, a.trend, a.leak, a.growing = {}, {}, nil, nil, false, false;
+            a.expect_note, a.expect_max, a.expected, a.over_cap = nil, nil, false, false;
         end
         if (base ~= nil) then
             local t = now_us();
             a.base = base;
+            if (exp_note ~= nil) then
+                a.expect_note, a.expect_max = exp_note, exp_max;
+            end
             push_hist(a.base_hist, t, base);
             judge_addon(a, t);
             log_line(('%s,%s,(gc baseline),0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), name, base));
@@ -716,7 +738,9 @@ local function addon_status(a)
     if (n < LEAK_MIN_N) then
         return ('collecting %d/%d'):fmt(n, LEAK_MIN_N), COL_STALE;
     end
+    if (a.over_cap) then return 'OVER CAP', COL_BAD; end
     if (a.leak) then return 'LEAK?', COL_BAD; end
+    if (a.expected) then return 'expected', COL_HEAD; end
     if (a.growing) then return 'growing', COL_WARN; end
     return 'stable', COL_OK;
 end
@@ -760,7 +784,7 @@ local function draw_memory()
     end);
 
     local flags = bit.bor(ImGuiTableFlags_RowBg, ImGuiTableFlags_BordersInnerV, ImGuiTableFlags_SizingStretchProp, ImGuiTableFlags_ScrollY);
-    if (imgui.BeginTable('##pm_mem', 7, flags, { 0, -40 })) then
+    if (imgui.BeginTable('##pm_mem', 7, flags, { 0, -60 })) then
         imgui.TableSetupScrollFreeze(0, 1);
         imgui.TableSetupColumn('Addon', ImGuiTableColumnFlags_WidthStretch, 2.0);
         imgui.TableSetupColumn('Now KB');
@@ -783,6 +807,10 @@ local function draw_memory()
             imgui.TableNextColumn();
             if (tr ~= nil) then imgui.Text(('%.2f'):fmt(tr.r2)); else imgui.TextDisabled('-'); end
             imgui.TableNextColumn(); imgui.TextColored(scol, st);
+            if (a.expect_note ~= nil and imgui.IsItemHovered()) then
+                imgui.SetTooltip(('Declared expected growth: %s%s'):fmt(a.expect_note,
+                    (a.expect_max or 0) > 0 and ('\nFlagged if after-GC memory passes %d KB.'):fmt(a.expect_max) or ''));
+            end
             imgui.TableNextColumn();
             if (#a.base_plot >= 2) then
                 imgui.PlotLines('##pm_b_' .. a.name, a.base_plot, #a.base_plot, 0, '', a.lo, a.hi, { -1, 18 });
@@ -790,8 +818,10 @@ local function draw_memory()
         end
         imgui.EndTable();
     end
-    imgui.TextDisabled(('Flags an addon when its after-GC memory grows >= %d KB/min (and +%d KB) steadily (fit >= %.1f) over %d min. Fit near 1 = straight-line growth.'):fmt(
+    imgui.PushStyleColor(ImGuiCol_Text, COL_STALE);
+    imgui.TextWrapped(('Flags an addon when its after-GC memory grows >= %d KB/min (and +%d KB) steadily (fit >= %.2f) over %d min. Fit near 1 = straight-line growth.'):fmt(
         LEAK_KB_MIN, LEAK_MIN_RISE, LEAK_R2, LEAK_WINDOW_US / 60000000));
+    imgui.PopStyleColor();
 end
 
 local function draw()
