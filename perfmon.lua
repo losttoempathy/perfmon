@@ -13,17 +13,24 @@
 *   /perfmon install all     Install into every loaded addon that isn't instrumented yet.
 *   /perfmon remove all      Remove from every addon perfmon installed into.
 *   /perfmon status          Show which loaded addons are instrumented.
+*   /perfmon mark [text]     Put a marker on the process memory graph (zones and addon
+*                            loads/unloads are marked automatically).
 *   /perfmon help            Show commands.
 *
 * Leak check: perf.lua sends a post-GC Lua memory baseline once a minute. perfmon fits a line
 * through the last 10 minutes of baselines and flags an addon whose baseline rises steadily.
 * It also samples the game process's private memory, which catches native leaks (FFI
 * allocations, textures, handles) that Lua memory can't see.
+*
+* Native breakdown (1.6): every 30 s the game's address space is scanned and logged by type
+* (private / mapped / image / reserved / largest free gap), plus handle and GDI/USER counts.
+* Zone, addon load/unload and /perfmon mark markers go into the CSV as (event) rows, and the
+* first row says whether the game is running on Windows or under Wine/Proton.
 --]]
 
 addon.name    = 'perfmon';
 addon.author  = 'Lift';
-addon.version = '1.4';
+addon.version = '1.6';
 addon.desc    = 'Performance dashboard for addons that use libs/perf.lua.';
 addon.link    = '';
 
@@ -131,6 +138,140 @@ do
 end
 
 --[[
+* Native memory breakdown (for leaks Lua can't see).
+*
+* vm_scan() walks the game's address space with VirtualQuery and totals it by type:
+*   private  - heap / VirtualAlloc memory (game, plugins, drivers' system-RAM copies)
+*   mapped   - file mappings / shared sections (graphics layers often put buffers here)
+*   image    - loaded EXE/DLL files
+*   reserved - address space set aside but not committed yet
+*   free_largest - biggest free gap. A 32-bit process dies when no gap is big enough for
+*                  an allocation, often well before total use reaches the limit.
+* Also: handle count, GDI/USER object counts, and whether we are running under Wine.
+* Every function returns nil when the API isn't there, and callers just skip the row.
+--]]
+local VM_SAMPLE_US = 30 * 1000000;   -- address-space scan interval
+local VM_BIG_KB    = 1024;           -- committed private regions this size or bigger count as "big"
+
+local vm_scan       = function () return nil; end;
+local handle_counts = function () return nil; end;
+local platform_str  = 'unknown';
+do
+    pcall(ffi.cdef, [[
+        typedef struct {
+            void*    BaseAddress;
+            void*    AllocationBase;
+            uint32_t AllocationProtect;
+            size_t   RegionSize;
+            uint32_t State;
+            uint32_t Protect;
+            uint32_t Type;
+        } PM_MBI;
+        size_t __stdcall VirtualQuery(const void* lpAddress, PM_MBI* lpBuffer, size_t dwLength);
+        int    __stdcall GetProcessHandleCount(void* hProcess, uint32_t* pdwHandleCount);
+        uint32_t __stdcall GetGuiResources(void* hProcess, uint32_t uiFlags);
+        const char* wine_get_version(void);
+        void wine_get_host_version(const char** sysname, const char** release);
+    ]]);
+
+    local MEM_COMMIT, MEM_RESERVE, MEM_FREE = 0x1000, 0x2000, 0x10000;
+    local MEM_PRIVATE, MEM_MAPPED, MEM_IMAGE = 0x20000, 0x40000, 0x1000000;
+
+    local okm, mbi = pcall(ffi.new, 'PM_MBI');
+    local okq, vq  = pcall(function () return ffi.C.VirtualQuery; end);
+    if (okm and okq and vq ~= nil) then
+        local msz = ffi.sizeof('PM_MBI');
+        local fn = function ()
+            local r = { private = 0, private_big = 0, mapped = 0, image = 0, reserved = 0,
+                        free_total = 0, free_largest = 0, regions = 0 };
+            local addr = 0x10000;
+            local limit = 2 ^ 32;
+            local guard = 0;
+            while (addr < limit and guard < 200000) do
+                guard = guard + 1;
+                if (vq(ffi.cast('const void*', ffi.cast('uintptr_t', addr)), mbi, msz) == 0) then
+                    break;
+                end
+                local size = tonumber(mbi.RegionSize);
+                if (size == nil or size <= 0) then break; end
+                local kb = size / 1024;
+                local state, typ = mbi.State, mbi.Type;
+                r.regions = r.regions + 1;
+                if (state == MEM_FREE) then
+                    r.free_total = r.free_total + kb;
+                    if (kb > r.free_largest) then r.free_largest = kb; end
+                elseif (state == MEM_RESERVE) then
+                    r.reserved = r.reserved + kb;
+                elseif (state == MEM_COMMIT) then
+                    if (typ == MEM_PRIVATE) then
+                        r.private = r.private + kb;
+                        if (kb >= VM_BIG_KB) then r.private_big = r.private_big + kb; end
+                    elseif (typ == MEM_MAPPED) then
+                        r.mapped = r.mapped + kb;
+                    elseif (typ == MEM_IMAGE) then
+                        r.image = r.image + kb;
+                    end
+                end
+                addr = tonumber(ffi.cast('uintptr_t', mbi.BaseAddress)) + size;
+            end
+            return r;
+        end;
+        local okc, v = pcall(fn);
+        if (okc and v ~= nil and v.regions > 0) then
+            vm_scan = fn;
+        end
+    end
+
+    -- Handles (kernel32) and GDI/USER objects (user32).
+    local okh, ghc = pcall(function () return ffi.C.GetProcessHandleCount; end);
+    local user32 = nil;
+    pcall(function () user32 = ffi.load('user32'); end);
+    local ggr = nil;
+    if (user32 ~= nil) then
+        pcall(function () ggr = user32.GetGuiResources; end);
+    end
+    local hbuf = ffi.new('uint32_t[1]');
+    local hfn = function ()
+        local _ = user32; -- keep the library loaded
+        local proc = ffi.C.GetCurrentProcess();
+        local r = {};
+        if (okh and ghc ~= nil and ghc(proc, hbuf) ~= 0) then r.handles = tonumber(hbuf[0]); end
+        if (ggr ~= nil) then
+            r.gdi  = tonumber(ggr(proc, 0));
+            r.user = tonumber(ggr(proc, 1));
+        end
+        return r;
+    end;
+    local okt, tv = pcall(hfn);
+    if (okt and tv ~= nil and (tv.handles ~= nil or tv.gdi ~= nil)) then
+        handle_counts = hfn;
+    end
+
+    -- Wine/Proton exports wine_get_version from ntdll; real Windows doesn't.
+    pcall(function ()
+        local ntdll = ffi.load('ntdll');
+        local okv, wgv = pcall(function () return ntdll.wine_get_version; end);
+        if (okv and wgv ~= nil) then
+            local ver = ffi.string(wgv());
+            local host = '';
+            pcall(function ()
+                local sys, rel = ffi.new('const char*[1]'), ffi.new('const char*[1]');
+                ntdll.wine_get_host_version(sys, rel);
+                host = (' on %s %s'):fmt(ffi.string(sys[0]), ffi.string(rel[0]));
+            end);
+            platform_str = ('wine %s%s'):fmt(ver, host);
+        else
+            platform_str = 'windows';
+        end
+    end);
+end
+
+-- CSV fields can't hold commas or newlines.
+local function csv_safe(s)
+    return (tostring(s):gsub('[,\r\n]', ' '));
+end
+
+--[[
 * History + trend helpers. hist = { {t=us, v=value}, ... } oldest first.
 --]]
 local function push_hist(hist, t, v)
@@ -222,7 +363,36 @@ local pm = {
     },
     -- game process memory
     proc = { kb = nil, peak = 0, at = 0, hist = {}, plot = {}, lo = 0, hi = 1, trend = nil, rising = false, warned = false },
+    -- native breakdown (last scan): see vm_scan() / handle_counts()
+    vm = { at = 0, last = nil, first = nil, handles = nil, first_handles = nil, scan_us = 0 },
+    -- markers on the process graph: { t, kind = 'zone'|'load'|'unload'|'mark', label }
+    events      = {},
+    prev_loaded = nil,        -- name -> true from the last addon-list refresh
 };
+
+local draw_event_markers, draw_event_list;
+
+local function log_line(str)
+    if (pm.log_on) then
+        pm.log_buf[#pm.log_buf + 1] = str;
+    end
+end
+local EVENT_AFTER_US = 30 * 1000000;   -- memory jump for a marker = sample ~30s after vs the one before
+
+local function add_event(kind, label)
+    local t = now_us();
+    local ev = pm.events;
+    -- The zone packet can arrive twice; drop exact repeats within 3s.
+    local last = ev[#ev];
+    if (last ~= nil and last.kind == kind and last.label == label and (t - last.t) < 3000000) then
+        return;
+    end
+    ev[#ev + 1] = { t = t, kind = kind, label = label };
+    log_line(('%s,(event),%s:%s,0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), kind, csv_safe(label), math.floor(pm.proc.kb or 0)));
+    while (#ev > 0 and (t - ev[1].t) > LEAK_KEEP_US) do
+        table.remove(ev, 1);
+    end
+end
 
 for i = 1, FRAME_RING do
     pm.ring[i] = 0;
@@ -241,12 +411,6 @@ local function get_addon(name)
         pm.addons[name] = a;
     end
     return a;
-end
-
-local function log_line(str)
-    if (pm.log_on) then
-        pm.log_buf[#pm.log_buf + 1] = str;
-    end
 end
 
 local function judge_addon(a, now)
@@ -366,7 +530,9 @@ local function set_logging(on)
         pm.log_path = ('%sperf_%s.csv'):fmt(dir, os.date('%Y%m%d_%H%M%S'));
         pm.log_buf  = { CSV_HEADER };
         pm.log_on   = true;
-        print(('[perfmon] logging to %s'):fmt(pm.log_path));
+        log_line(('%s,(game),platform:%s,0,0,0,0,0'):fmt(os.date('%H:%M:%S'), csv_safe(platform_str)));
+        pm.vm.at = 0; -- write a native breakdown right away
+        print(('[perfmon] logging to %s (platform: %s)'):fmt(pm.log_path, platform_str));
     else
         flush_log();
         pm.log_on = false;
@@ -455,6 +621,41 @@ local function proc_tick(t)
         p.warned = false;
     end
     log_line(('%s,(game),process_private,0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), math.floor(kb)));
+end
+
+--[[
+* Native breakdown sampling (every 30 s). Rows: (game),vm_<kind> / handles / gdi / user,
+* value in the mem_kb column (KB for vm_*, a count for the others). vm_scan_us = scan cost.
+--]]
+local VM_ROWS = { 'private', 'private_big', 'mapped', 'image', 'reserved', 'free_total', 'free_largest', 'regions' };
+local function vm_tick(t)
+    local v = pm.vm;
+    if ((t - v.at) < VM_SAMPLE_US) then
+        return;
+    end
+    v.at = t;
+    local ts = os.date('%H:%M:%S');
+    local t0 = now_us();
+    local okv, r = pcall(vm_scan);
+    v.scan_us = now_us() - t0;
+    if (okv and r ~= nil) then
+        v.last = r;
+        v.first = v.first or r;
+        for _, k in ipairs(VM_ROWS) do
+            log_line(('%s,(game),vm_%s,0,0,0,0,%d'):fmt(ts, k, math.floor(r[k])));
+        end
+        log_line(('%s,(game),vm_scan_us,1,%.1f,%d,0,0'):fmt(ts, v.scan_us, math.floor(v.scan_us)));
+    end
+    local okh, h = pcall(handle_counts);
+    if (okh and h ~= nil) then
+        v.handles = h;
+        v.first_handles = v.first_handles or h;
+        for _, k in ipairs({ 'handles', 'gdi', 'user' }) do
+            if (h[k] ~= nil) then
+                log_line(('%s,(game),%s,0,0,0,0,%d'):fmt(ts, k, h[k]));
+            end
+        end
+    end
 end
 
 local COL_OK    = { 0.6, 1.0, 0.6, 1.0 };
@@ -702,6 +903,19 @@ local function refresh_others(t, force)
     table.sort(others);
     mgr.loaded = loaded;
     pm.others  = others;
+
+    -- Addon load/unload markers for the process graph (skipped on the first refresh).
+    local now_set = {};
+    for _, n in ipairs(loaded) do now_set[n] = true; end
+    if (pm.prev_loaded ~= nil) then
+        for _, n in ipairs(loaded) do
+            if (not pm.prev_loaded[n]) then add_event('load', n); end
+        end
+        for n in pairs(pm.prev_loaded) do
+            if (not now_set[n]) then add_event('unload', n); end
+        end
+    end
+    pm.prev_loaded = now_set;
 end
 
 -- Names of loaded addons a batch action would touch (install: 'none', remove: 'auto').
@@ -1004,6 +1218,107 @@ local function cmp_mem(x, y)
     return sort_cmp(st, mem_key(x, st.col), mem_key(y, st.col), x.name, y.name);
 end
 
+--[[
+* Process graph markers
+--]]
+local EVENT_COL = {
+    zone   = { 0.4, 0.85, 1.0, 0.9 },
+    load   = { 0.5, 1.0, 0.5, 0.9 },
+    unload = { 1.0, 0.65, 0.3, 0.9 },
+    mark   = { 1.0, 1.0, 1.0, 0.9 },
+};
+local EVENT_TAG = { zone = 'zone', load = 'load', unload = 'unload', mark = 'mark' };
+
+-- Ashita's imgui returns ImVec2 either as two numbers or as a table, depending on the build.
+local function xy(a, b)
+    if (type(a) == 'number') then return a, b or 0; end
+    if (a == nil) then return 0, 0; end
+    if (type(a) == 'table' and a[1] ~= nil) then return a[1], a[2] or 0; end
+    return a.x or 0, a.y or 0;   -- table or userdata ImVec2
+end
+
+-- Process MB just before t, and the first sample at least EVENT_AFTER_US after it (nil if not yet).
+local function mem_around(hist, t)
+    local before, after;
+    for i = 1, #hist do
+        local h = hist[i];
+        if (h.t <= t) then
+            before = h.v;
+        elseif (after == nil and (h.t - t) >= EVENT_AFTER_US) then
+            after = h.v;
+            break;
+        end
+    end
+    return before, after;
+end
+
+local function ago(t)
+    local s = (now_us() - t) / 1000000;
+    if (s < 60) then return ('%ds ago'):fmt(s); end
+    return ('%.0fm ago'):fmt(s / 60);
+end
+
+local function event_text(p, e)
+    local b, a = mem_around(p.hist, e.t);
+    local d = (b ~= nil and a ~= nil) and ('  %+.0f MB'):fmt(a - b) or '  (measuring...)';
+    return ('%s %s, %s%s'):fmt(EVENT_TAG[e.kind] or e.kind, e.label, ago(e.t), d);
+end
+
+-- Vertical lines over the plot just drawn, one per event inside the plotted time span.
+draw_event_markers = function (p)
+    local hist = p.hist;
+    if (#hist < 2 or #pm.events == 0) then return; end
+    local t0, t1 = hist[1].t, hist[#hist].t;
+    if (t1 <= t0) then return; end
+
+    local ok = pcall(function ()
+        local x0, y0 = xy(imgui.GetItemRectMin());
+        local x1, y1 = xy(imgui.GetItemRectMax());
+        local px, py = 3, 3;
+        pcall(function () px, py = xy(imgui.GetStyle().FramePadding); end);
+        x0, x1, y0, y1 = x0 + px, x1 - px, y0 + py, y1 - py;
+        local dl = imgui.GetWindowDrawList();
+        local hovered = imgui.IsItemHovered();
+        local mx = hovered and xy(imgui.GetMousePos()) or nil;
+        local tips = {};
+
+        for _, e in ipairs(pm.events) do
+            if (e.t >= t0 and e.t <= t1) then
+                local x = x0 + (x1 - x0) * ((e.t - t0) / (t1 - t0));
+                dl:AddLine({ x, y0 }, { x, y1 }, imgui.GetColorU32(EVENT_COL[e.kind] or EVENT_COL.mark), 1.0);
+                if (mx ~= nil and math.abs(mx - x) <= 4) then
+                    tips[#tips + 1] = event_text(p, e);
+                end
+            end
+        end
+        if (#tips > 0) then
+            imgui.SetTooltip(table.concat(tips, '\n'));
+        end
+    end);
+    if (not ok) then
+        pm.markers_failed = true;
+    end
+end
+
+-- The last few events with the memory jump each one caused, newest first.
+draw_event_list = function (p)
+    if (#pm.events == 0) then
+        imgui.TextDisabled('Markers: blue = zone, green = addon load, orange = addon unload, white = /perfmon mark. None yet.');
+        return;
+    end
+    imgui.TextDisabled('Markers: blue = zone, green = load, orange = unload, white = /perfmon mark. Hover the graph for details.');
+    local shown = 0;
+    for i = #pm.events, 1, -1 do
+        local e = pm.events[i];
+        imgui.TextColored(EVENT_COL[e.kind] or EVENT_COL.mark, '  ' .. event_text(p, e));
+        shown = shown + 1;
+        if (shown >= 4) then break; end
+    end
+    if (pm.markers_failed) then
+        imgui.TextDisabled('  (graph markers could not be drawn on this imgui build; the list above still works)');
+    end
+end
+
 local function draw_memory()
     local p = pm.proc;
     local any_leak = false;
@@ -1025,10 +1340,14 @@ local function draw_memory()
         end
         if (#p.plot >= 2) then
             imgui.PlotLines('##pm_proc', p.plot, #p.plot, 0, 'process MB (every 10s)', p.lo, p.hi, { -1, 50 });
+            draw_event_markers(p);
         end
         if (p.rising and not any_leak) then
-            imgui.TextColored(COL_WARN, 'Process memory is rising but no addon\'s Lua memory is. Likely native: FFI allocations, textures/fonts not released, or the game itself (zoning also loads data).');
+            imgui.PushStyleColor(ImGuiCol_Text, COL_WARN);
+            imgui.TextWrapped('Process memory is rising but no addon\'s Lua memory is. Likely native: FFI allocations, textures/fonts not released, or the game itself (zoning also loads data). Check the markers below: a jump right after a zone or an addon load points at the cause.');
+            imgui.PopStyleColor();
         end
+        draw_event_list(p);
     end
 
     imgui.Separator();
@@ -1256,6 +1575,21 @@ local function print_mem()
     else
         print('[perfmon] game process memory not available.');
     end
+    print(('[perfmon] platform: %s'):fmt(platform_str));
+    local v = pm.vm;
+    if (v.last ~= nil) then
+        local r, f = v.last, v.first;
+        local function mb(k) return ('%.0f MB (%+.0f)'):fmt(r[k] / 1024, (r[k] - f[k]) / 1024); end
+        print(('[perfmon] native: private %s, big private %s, mapped %s, image %s, reserved %s'):fmt(
+            mb('private'), mb('private_big'), mb('mapped'), mb('image'), mb('reserved')));
+        print(('[perfmon] address space: largest free gap %s, free total %s, %d regions (scan %.1f ms)'):fmt(
+            mb('free_largest'), mb('free_total'), r.regions, v.scan_us / 1000));
+    end
+    if (v.handles ~= nil) then
+        local h, f = v.handles, v.first_handles;
+        local function c(k) return h[k] and ('%d (%+d)'):fmt(h[k], h[k] - (f[k] or h[k])) or '-'; end
+        print(('[perfmon] handles %s, GDI %s, USER %s   (changes are since perfmon loaded)'):fmt(c('handles'), c('gdi'), c('user')));
+    end
     for _, a in pairs(pm.addons) do
         local st = addon_status(a);
         local tr = a.trend;
@@ -1271,6 +1605,7 @@ local function print_help()
     print('[perfmon] /perfmon reset - clear all collected data');
     print('[perfmon] /perfmon print - summary to chat');
     print('[perfmon] /perfmon mem - memory / leak-check summary to chat');
+    print('[perfmon] /perfmon mark [text] - put a marker on the process memory graph');
     print('[perfmon] /perfmon install <addon> - add auto-instrumentation to a loaded addon (edits its .lua, makes .perfbak backup, reloads it)');
     print('[perfmon] /perfmon remove <addon> - take it back out and reload');
     print('[perfmon] /perfmon install all - install into every loaded addon that is not instrumented yet');
@@ -1311,7 +1646,12 @@ ashita.events.register('command', 'perfmon_command', function (e)
         pm.hitch_total = 0;
         pm.proc.hist, pm.proc.plot, pm.proc.trend, pm.proc.rising, pm.proc.warned = {}, {}, nil, false, false;
         pm.proc.peak = pm.proc.kb or 0;
+        pm.events = {};
         print('[perfmon] reset.');
+    elseif (sub == 'mark') then
+        local text = table.concat(args, ' ', 3);
+        add_event('mark', text ~= '' and text or 'mark');
+        print(('[perfmon] marked: %s'):fmt(text ~= '' and text or 'mark'));
     elseif (sub == 'print') then
         print_summary();
     elseif (sub == 'mem' or sub == 'leak' or sub == 'leaks') then
@@ -1347,6 +1687,7 @@ ashita.events.register('d3d_present', 'perfmon_present', function ()
     local t = now_us();
     frame_tick(t);
     proc_tick(t);
+    vm_tick(t);
     refresh_others(t);
     draw();
 
@@ -1354,6 +1695,17 @@ ashita.events.register('d3d_present', 'perfmon_present', function ()
         flush_log();
     end
     pm.self_tot = pm.self_tot + (now_us() - t);
+end);
+
+-- Zone-in (0x000A): mark the process graph with the zone name.
+ashita.events.register('packet_in', 'perfmon_packet_in', function (e)
+    if (e.id ~= 0x000A or e.data == nil or #e.data < 0x32) then
+        return;
+    end
+    local zid = e.data:byte(0x31) + e.data:byte(0x32) * 256;
+    local name;
+    pcall(function () name = AshitaCore:GetResourceManager():GetString('zones.names', zid); end);
+    add_event('zone', (name ~= nil and name ~= '') and name or ('zone ' .. zid));
 end);
 
 ashita.events.register('unload', 'perfmon_unload', function ()

@@ -225,6 +225,17 @@ time,addon,section,calls,avg_us,max_us,ms_per_s,mem_kb
 | `(game),frame` | Frames that second, average / worst frame time (µs), perfmon's own ms/s, perfmon's Lua memory. |
 | `<addon>,(gc baseline)` | The after-GC Lua memory reading (once a minute). Chart `mem_kb` to see a leak. |
 | `(game),process_private` | Game process private memory in KB (every 10 s). |
+| `(game),platform:<text>` | First row of each log: `windows`, or `wine <version> on <OS> <kernel>` under Wine/Proton. |
+| `(event),<kind>:<label>` | A marker: `zone:<zone name>`, `load:<addon>`, `unload:<addon>` or `mark:<text>`. `mem_kb` = process private memory at that moment. |
+| `(game),vm_private` | Committed private memory (heaps, VirtualAlloc) in KB, every 30 s. |
+| `(game),vm_private_big` | The part of `vm_private` in regions of 1 MB or more (large buffers, texture copies). Growth in the rest = many small allocations. |
+| `(game),vm_mapped` | Committed mapped memory (shared sections, file mappings) in KB. Graphics layers often allocate here. |
+| `(game),vm_image` | Committed memory of loaded EXE/DLL files in KB. Growth means modules being loaded repeatedly. |
+| `(game),vm_reserved` | Address space reserved but not committed, in KB. |
+| `(game),vm_free_total` / `vm_free_largest` | Free address space and the biggest free gap, in KB. A 32-bit game crashes when the largest gap gets too small for an allocation, even if the total is still large. |
+| `(game),vm_regions` | Number of address-space regions (a count). A steady climb means fragmentation. |
+| `(game),vm_scan_us` | How long the scan took (`avg_us`). |
+| `(game),handles` / `gdi` / `user` | Open kernel handles and GDI / USER objects (counts, in `mem_kb`). |
 
 ---
 
