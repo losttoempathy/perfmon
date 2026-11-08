@@ -9,6 +9,9 @@
 *   - Keeps rolling 1-second stats (calls, avg, max) plus an all-time peak per section.
 *   - Tracks this addon's Lua memory (KB), plus a post-GC "baseline" once a minute for leak
 *     detection (perfmon watches the baseline's trend and flags steady growth).
+*   - Counts this addon's live native objects: fonts (fonts.lua), primitives (primitives.lua) and
+*     COM objects such as textures wrapped with d3d8.gc_safe_release. A count that keeps climbing
+*     means objects are created and never destroyed, a native leak Lua memory can't show.
 *   - Optional per-addon ImGui panel:  /perf <addonname>
 *   - If the 'perfmon' addon is loaded, sends a 1-second summary to it so you can see every
 *     instrumented addon in one dashboard.
@@ -40,6 +43,9 @@ local perf = {
     growth_max  = 0,
     show        = { false },
     seq         = 0,
+    gc_now      = false,    -- set by '/perf gc': force a GC + baseline on the next roll-up
+    -- live native objects owned by this addon, and how many were ever created
+    obj         = { fonts = 0, prims = 0, com = 0, fonts_made = 0, prims_made = 0, com_made = 0 },
 };
 
 --[[
@@ -74,6 +80,84 @@ do
     end
 end
 perf.now_us = now_us;
+
+--[[
+* Native object counting.
+*
+* fonts.lua and primitives.lua keep every live object in <lib>.cache until :destroy() is
+* called, so the live count is just #cache. Their new() is wrapped to count creations (churn).
+* d3d8.gc_safe_release is wrapped so each COM object (usually a texture) it manages is counted
+* until the garbage collector releases it.
+* Objects created straight through AshitaCore's font/primitive managers, or textures released
+* by hand, are not seen.
+--]]
+local function count_new(m, field)
+    if (type(m.new) ~= 'function' or rawget(m, '__perf_counted')) then
+        return;
+    end
+    local orig_new = m.new;
+    rawset(m, '__perf_counted', true);
+    m.new = function (...)
+        perf.obj[field] = perf.obj[field] + 1;
+        return orig_new(...);
+    end;
+end
+
+local function patch_module(name, m)
+    if (type(m) ~= 'table' or type(name) ~= 'string') then
+        return;
+    end
+    local base = name:lower():match('([^%.%/\\]+)$') or name:lower();
+    if (base == 'fonts') then
+        count_new(m, 'fonts_made');
+    elseif (base == 'primitives') then
+        count_new(m, 'prims_made');
+    elseif (base == 'd3d8' and type(m.gc_safe_release) == 'function' and not rawget(m, '__perf_counted')) then
+        rawset(m, '__perf_counted', true);
+        m.gc_safe_release = function (o)
+            if (o == nil) then
+                error('Invalid object for safe_release!');
+            end
+            perf.obj.com      = perf.obj.com + 1;
+            perf.obj.com_made = perf.obj.com_made + 1;
+            return ffi.gc(o, function (v)
+                perf.obj.com = perf.obj.com - 1;
+                v:Release();
+            end);
+        end;
+    end
+end
+
+-- Patch libs already loaded, then catch the ones this addon requires later.
+for _, n in ipairs({ 'fonts', 'primitives', 'd3d8' }) do
+    patch_module(n, package.loaded[n]);
+end
+do
+    local orig_require = require;
+    local ok = pcall(function ()
+        require = function (name, ...)
+            local m = orig_require(name, ...);
+            pcall(patch_module, name, m);
+            return m;
+        end;
+    end);
+    if (not ok) then
+        require = orig_require;
+    end
+end
+
+local function cache_len(name)
+    local m = package.loaded[name];
+    if (type(m) ~= 'table' or type(rawget(m, 'cache')) ~= 'table') then
+        return 0;
+    end
+    return #m.cache;
+end
+
+local function count_objects()
+    perf.obj.fonts = cache_len('fonts');
+    perf.obj.prims = cache_len('primitives');
+end
 
 --[[
 * Section stats
@@ -233,6 +317,8 @@ local function send_report(win_ms)
         end
         perf.base_fresh = false;
     end
+    local o = perf.obj;
+    head = head .. ('o%d:%d:%d:%d:%d:%d '):fmt(o.fonts, o.prims, o.com, o.fonts_made, o.prims_made, o.com_made);
 
     local buf = head;
     local sent = false;
@@ -268,7 +354,11 @@ local next_base = nil;
 local trough    = math.huge;
 
 local function sample_baseline(t)
-    local forced = (perf.gc_interval_s ~= nil and perf.gc_interval_s > 0);
+    local forced = perf.gc_now or (perf.gc_interval_s ~= nil and perf.gc_interval_s > 0);
+    if (perf.gc_now) then
+        perf.gc_now = false;
+        next_base = 0;   -- take the baseline now
+    end
     if (not forced and perf.mem_kb < trough) then
         trough = perf.mem_kb;
     end
@@ -315,6 +405,7 @@ local function roll()
     perf.mem_kb = collectgarbage('count');
     if (perf.mem_kb > perf.mem_peak_kb) then perf.mem_peak_kb = perf.mem_kb; end
     local gc_us = sample_baseline(t);
+    count_objects();
 
     if (perf.report and perfmon_loaded()) then
         send_report(win);
@@ -346,6 +437,9 @@ local function draw_panel()
         else
             imgui.Text(('Lua memory: %.0f KB  (peak %.0f KB)'):fmt(perf.mem_kb, perf.mem_peak_kb));
         end
+        local o = perf.obj;
+        imgui.Text(('Live objects: %d fonts, %d primitives, %d COM/textures  (created %d / %d / %d)'):fmt(
+            o.fonts, o.prims, o.com, o.fonts_made, o.prims_made, o.com_made));
         imgui.SameLine();
         if (imgui.SmallButton('Reset')) then perf.reset(); end
         imgui.SameLine();
@@ -385,6 +479,9 @@ end
 function perf.print()
     print(('[perf:%s] mem %.0f KB (peak %.0f KB, after GC %s KB)'):fmt(addon.name, perf.mem_kb, perf.mem_peak_kb,
         perf.mem_base_kb and ('%.0f'):fmt(perf.mem_base_kb) or '?'));
+    local o = perf.obj;
+    print(('[perf:%s] live objects: %d fonts, %d primitives, %d COM/textures  (created: %d / %d / %d)'):fmt(
+        addon.name, o.fonts, o.prims, o.com, o.fonts_made, o.prims_made, o.com_made));
     for _, n in ipairs(perf.order) do
         local s = perf.sections[n];
         local avg = (s.l_n > 0) and (s.l_tot / s.l_n) or 0;
@@ -406,6 +503,13 @@ ashita.events.register('command', '__perf_lib_command', function (e)
         return;
     end
     e.blocked = true;
+
+    -- /perf gc  -> every instrumented addon collects garbage and reports a fresh baseline
+    -- (perfmon sends this before a snapshot so the numbers are clean).
+    if (#args >= 2 and args[2]:lower() == 'gc') then
+        perf.gc_now = true;
+        return;
+    end
 
     -- /perf  or  /perf list  -> every instrumented addon announces itself
     if (#args == 1 or args[2]:lower() == 'list') then
@@ -430,7 +534,7 @@ ashita.events.register('command', '__perf_lib_command', function (e)
     elseif (sub == 'off') then
         perf.enabled = false;
     else
-        print('[perf] usage: /perf <addon> [show|print|reset|on|off]   /perf list');
+        print('[perf] usage: /perf <addon> [show|print|reset|on|off]   /perf list   /perf gc');
     end
 end);
 

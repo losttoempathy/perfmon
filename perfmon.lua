@@ -13,6 +13,8 @@
 *   /perfmon install all     Install into every loaded addon that isn't instrumented yet.
 *   /perfmon remove all      Remove from every addon perfmon installed into.
 *   /perfmon status          Show which loaded addons are instrumented.
+*   /perfmon snap            Snapshot memory, address space, handles and per-addon objects.
+*   /perfmon diff            Show what changed since the snapshot (both force a GC first).
 *   /perfmon mark [text]     Put a marker on the process memory graph (zones and addon
 *                            loads/unloads are marked automatically).
 *   /perfmon help            Show commands.
@@ -26,11 +28,15 @@
 * (private / mapped / image / reserved / largest free gap), plus handle and GDI/USER counts.
 * Zone, addon load/unload and /perfmon mark markers go into the CSV as (event) rows, and the
 * first row says whether the game is running on Windows or under Wine/Proton.
+*
+* 1.7: Memory tab shows address-space headroom with an estimated time until it runs out,
+* live font / primitive / texture counts per addon (needs the matching perf.lua), and
+* snapshot / diff.
 --]]
 
 addon.name    = 'perfmon';
 addon.author  = 'Lift';
-addon.version = '1.6';
+addon.version = '1.7';
 addon.desc    = 'Performance dashboard for addons that use libs/perf.lua.';
 addon.link    = '';
 
@@ -151,7 +157,11 @@ end
 * Every function returns nil when the API isn't there, and callers just skip the row.
 --]]
 local VM_SAMPLE_US = 30 * 1000000;   -- address-space scan interval
-local VM_BIG_KB    = 1024;           -- committed private regions this size or bigger count as "big"
+local VM_BIG_KB    = 1024;
+local VM_MIN_N     = 6;              -- scans needed (~3 min) before estimating time to run out
+local VM_MARGIN_MB = 64;             -- treat the address space as gone when this little is free
+local OBJ_RISE     = 10;             -- live objects must grow at least this much...
+local OBJ_PER_MIN  = 1;              -- ...at this rate, steadily, to be flagged           -- committed private regions this size or bigger count as "big"
 
 local vm_scan       = function () return nil; end;
 local handle_counts = function () return nil; end;
@@ -358,19 +368,23 @@ local pm = {
     -- text = columns that start A-Z when picked (numbers start biggest first); nosort = not clickable.
     sorts = {
         stats = { col = 6, asc = false, def_col = 6, def_asc = false, text = { [1] = true } },
-        mem   = { col = 4, asc = false, def_col = 4, def_asc = false, text = { [1] = true }, nosort = { [7] = true } },
+        mem   = { col = 4, asc = false, def_col = 4, def_asc = false, text = { [1] = true }, nosort = { [8] = true } },
         inst  = { col = 1, asc = true,  def_col = 1, def_asc = true,  text = { [1] = true, [2] = true }, nosort = { [4] = true } },
     },
     -- game process memory
     proc = { kb = nil, peak = 0, at = 0, hist = {}, plot = {}, lo = 0, hi = 1, trend = nil, rising = false, warned = false },
     -- native breakdown (last scan): see vm_scan() / handle_counts()
-    vm = { at = 0, last = nil, first = nil, handles = nil, first_handles = nil, scan_us = 0 },
+    vm = { at = 0, last = nil, first = nil, handles = nil, first_handles = nil, scan_us = 0,
+           free_hist = {}, free_trend = nil, h_hist = {}, h_trend = nil },
+    -- snapshot / diff
+    snap = nil, diff = nil, capture = nil,
     -- markers on the process graph: { t, kind = 'zone'|'load'|'unload'|'mark', label }
     events      = {},
     prev_loaded = nil,        -- name -> true from the last addon-list refresh
 };
 
 local draw_event_markers, draw_event_list;
+local obj_risers, draw_obj_cell, draw_native, draw_snapshot, request_capture, capture_tick;
 
 local function log_line(str)
     if (pm.log_on) then
@@ -407,7 +421,8 @@ local function get_addon(name)
     local a = pm.addons[name];
     if (a == nil) then
         a = { name = name, seq = -1, mem = 0, mem_peak = 0, win_ms = 1000, seen = 0, sections = {}, order = {}, total_us = 0,
-              base = nil, base_hist = {}, base_plot = {}, lo = 0, hi = 1, trend = nil, leak = false, growing = false };
+              base = nil, base_hist = {}, base_plot = {}, lo = 0, hi = 1, trend = nil, leak = false, growing = false,
+              obj = nil, obj_first = nil, obj_hist = {}, obj_trend = nil, obj_rising = false };
         pm.addons[name] = a;
     end
     return a;
@@ -457,6 +472,18 @@ local function handle_report(cmd)
         end
     end
 
+    -- Optional live object counts:  o<fonts>:<prims>:<com>:<fonts made>:<prims made>:<com made>
+    local obj = nil;
+    local ostr, rest3 = payload:match('^o([%d:]+)%s+(.*)$');
+    if (ostr ~= nil) then
+        payload = rest3;
+        local f, pr, c, fm, pm_, cm = ostr:match('^(%d+):(%d+):(%d+):(%d+):(%d+):(%d+)$');
+        if (f ~= nil) then
+            obj = { fonts = tonumber(f), prims = tonumber(pr), com = tonumber(c),
+                    fonts_made = tonumber(fm), prims_made = tonumber(pm_), com_made = tonumber(cm) };
+        end
+    end
+
     local a = get_addon(name);
 
     -- A new seq means a new 1s window; continuation chunks share the same seq.
@@ -465,6 +492,11 @@ local function handle_report(cmd)
         if (seq < a.seq) then
             a.base_hist, a.base_plot, a.base, a.trend, a.leak, a.growing = {}, {}, nil, nil, false, false;
             a.expect_note, a.expect_max, a.expected, a.over_cap = nil, nil, false, false;
+            a.obj_hist, a.obj_trend, a.obj_rising, a.obj_first = {}, nil, false, nil;
+        end
+        if (obj ~= nil) then
+            a.obj = obj;
+            a.obj_first = a.obj_first or obj;
         end
         if (base ~= nil) then
             local t = now_us();
@@ -474,6 +506,15 @@ local function handle_report(cmd)
             end
             push_hist(a.base_hist, t, base);
             judge_addon(a, t);
+            if (a.obj ~= nil) then
+                -- Live object count, sampled with the once-a-minute baseline.
+                local live = a.obj.fonts + a.obj.prims + a.obj.com;
+                push_hist(a.obj_hist, t, live);
+                local otr = trend(a.obj_hist, t);
+                a.obj_trend = otr;
+                a.obj_rising = (otr ~= nil and otr.n >= LEAK_MIN_N and otr.slope >= OBJ_PER_MIN and otr.rise >= OBJ_RISE and otr.r2 >= LEAK_R2);
+                log_line(('%s,%s,(objects),%d,%d,%d,0,%d'):fmt(os.date('%H:%M:%S'), name, a.obj.fonts, a.obj.prims, a.obj.com, live));
+            end
             log_line(('%s,%s,(gc baseline),0,0,0,0,%d'):fmt(os.date('%H:%M:%S'), name, base));
         end
         a.seq      = seq;
@@ -641,6 +682,8 @@ local function vm_tick(t)
     if (okv and r ~= nil) then
         v.last = r;
         v.first = v.first or r;
+        push_hist(v.free_hist, t, r.free_total / 1024);   -- MB
+        v.free_trend = trend(v.free_hist, t);
         for _, k in ipairs(VM_ROWS) do
             log_line(('%s,(game),vm_%s,0,0,0,0,%d'):fmt(ts, k, math.floor(r[k])));
         end
@@ -650,6 +693,10 @@ local function vm_tick(t)
     if (okh and h ~= nil) then
         v.handles = h;
         v.first_handles = v.first_handles or h;
+        if (h.handles ~= nil) then
+            push_hist(v.h_hist, t, h.handles);
+            v.h_trend = trend(v.h_hist, t);
+        end
         for _, k in ipairs({ 'handles', 'gdi', 'user' }) do
             if (h[k] ~= nil) then
                 log_line(('%s,(game),%s,0,0,0,0,%d'):fmt(ts, k, h[k]));
@@ -1187,8 +1234,8 @@ local function addon_status(a)
     return 'stable', COL_OK;
 end
 
-local MEM_COLS = { 'Addon', 'Now KB', 'After GC KB', 'KB/min', 'Fit', 'Status', 'After-GC history' };
-local MEM_W    = { 1.6, 1.0, 1.2, 1.0, 0.8, 1.5, 2.2 };
+local MEM_COLS = { 'Addon', 'Now KB', 'After GC KB', 'KB/min', 'Fit', 'Status', 'Objects', 'After-GC history' };
+local MEM_W    = { 1.6, 1.0, 1.2, 1.0, 0.8, 1.5, 1.4, 2.0 };
 
 -- Status column sorts by severity (worst = biggest), not alphabetically.
 local function mem_status_rank(a)
@@ -1207,6 +1254,10 @@ local function mem_key(a, col)
     if (col == 3) then return a.base or -math.huge; end
     if (col == 4) then return a.trend and a.trend.slope or -math.huge; end
     if (col == 5) then return a.trend and a.trend.r2 or -math.huge; end
+    if (col == 7) then
+        if (a.obj == nil) then return -math.huge; end
+        return (a.obj_rising and 1000000 or 0) + a.obj.fonts + a.obj.prims + a.obj.com;
+    end
     return mem_status_rank(a);
 end
 
@@ -1319,6 +1370,264 @@ draw_event_list = function (p)
     end
 end
 
+--[[
+* Objects column, address space panel, snapshot / diff
+--]]
+obj_risers = function ()
+    local r = {};
+    for _, a in pairs(pm.addons) do
+        if (a.obj_rising) then r[#r + 1] = a.name; end
+    end
+    table.sort(r);
+    return r;
+end
+
+draw_obj_cell = function (a)
+    local o = a.obj;
+    if (o == nil) then
+        imgui.TextDisabled('-');
+        if (imgui.IsItemHovered()) then
+            imgui.SetTooltip('No object counts: this addon uses an older perf.lua (update addons/libs/perf.lua and reload it).');
+        end
+        return;
+    end
+    local live = o.fonts + o.prims + o.com;
+    local f = a.obj_first or o;
+    local d = live - (f.fonts + f.prims + f.com);
+    local col = a.obj_rising and COL_BAD or ((d >= OBJ_RISE) and COL_WARN or nil);
+    local txt = (d ~= 0) and ('%d (%+d)'):fmt(live, d) or ('%d'):fmt(live);
+    if (col ~= nil) then imgui.TextColored(col, txt); elseif (live == 0) then imgui.TextDisabled(txt); else imgui.Text(txt); end
+    if (imgui.IsItemHovered()) then
+        local tr = a.obj_trend;
+        imgui.SetTooltip(('Live: %d fonts, %d primitives, %d COM/textures\nCreated since load: %d / %d / %d\nChange since first seen: %+d%s%s'):fmt(
+            o.fonts, o.prims, o.com, o.fonts_made, o.prims_made, o.com_made, d,
+            tr and ('\nTrend %+.1f objects/min (fit %.2f)'):fmt(tr.slope, tr.r2) or '',
+            a.obj_rising and '\nRISING STEADILY: objects are created and never destroyed.' or ''));
+    end
+end
+
+local function fmt_dur(mins)
+    if (mins >= 120) then return ('%.0fh %02dm'):fmt(math.floor(mins / 60), math.floor(mins % 60)); end
+    if (mins >= 60) then return ('%dh %02dm'):fmt(math.floor(mins / 60), math.floor(mins % 60)); end
+    return ('%.0f min'):fmt(mins);
+end
+
+-- Minutes until free address space reaches VM_MARGIN_MB at the current trend (nil = not shrinking).
+local function vm_eta()
+    local v = pm.vm;
+    local tr = v.free_trend;
+    if (v.last == nil or tr == nil or tr.n < VM_MIN_N or tr.slope >= -0.1 or tr.r2 < 0.5) then
+        return nil;
+    end
+    local left = v.last.free_total / 1024 - VM_MARGIN_MB;
+    if (left <= 0) then return 0; end
+    return left / -tr.slope;
+end
+
+draw_native = function ()
+    local v = pm.vm;
+    local r = v.last;
+    if (r == nil) then
+        imgui.TextDisabled('Address space: first scan in a few seconds...');
+        return;
+    end
+    local used = (r.private + r.mapped + r.image + r.reserved) / 1024;
+    local total = used + r.free_total / 1024;
+    local f = v.first;
+    local col = COL_HEAD;
+    if (r.free_largest / 1024 < 64 or r.free_total / 1024 < 256) then col = COL_BAD;
+    elseif (r.free_largest / 1024 < 200 or r.free_total / 1024 < 512) then col = COL_WARN; end
+    imgui.TextColored(col, ('Address space: %.0f of %.0f MB used, %.0f MB free (%+.0f), largest free gap %.0f MB (%+.0f)'):fmt(
+        used, total, r.free_total / 1024, (r.free_total - f.free_total) / 1024, r.free_largest / 1024, (r.free_largest - f.free_largest) / 1024));
+    if (imgui.IsItemHovered()) then
+        imgui.SetTooltip(('FFXI is a 32-bit program: it crashes when no free gap is big enough for an allocation,\n'
+            .. 'often before total memory looks full. Zoning needs the biggest gaps.\n\n'
+            .. 'private %.0f MB (%+.0f)   big private %.0f MB (%+.0f)\nmapped %.0f MB (%+.0f)   image %.0f MB (%+.0f)   reserved %.0f MB (%+.0f)\n'
+            .. '%d regions, scan %.1f ms, every %ds.  Platform: %s'):fmt(
+            r.private / 1024, (r.private - f.private) / 1024, r.private_big / 1024, (r.private_big - f.private_big) / 1024,
+            r.mapped / 1024, (r.mapped - f.mapped) / 1024, r.image / 1024, (r.image - f.image) / 1024,
+            r.reserved / 1024, (r.reserved - f.reserved) / 1024, r.regions, v.scan_us / 1000, VM_SAMPLE_US / 1000000, platform_str));
+    end
+
+    local tr = v.free_trend;
+    local eta = vm_eta();
+    if (eta ~= nil) then
+        local ecol = (eta < 60) and COL_BAD or ((eta < 240) and COL_WARN or COL_HEAD);
+        imgui.TextColored(ecol, ('  Free space shrinking %.1f MB/min (fit %.2f): runs out in about %s at this rate.'):fmt(-tr.slope, tr.r2, fmt_dur(eta)));
+    elseif (tr ~= nil and tr.n < VM_MIN_N) then
+        imgui.TextDisabled(('  Time-to-run-out estimate after %d scans (%d so far).'):fmt(VM_MIN_N, tr.n));
+    else
+        imgui.TextDisabled('  Free address space is not shrinking steadily. No crash in sight from memory.');
+    end
+    if (r.free_largest / 1024 < 64) then
+        imgui.TextColored(COL_BAD, '  Fragmented: the biggest free gap is under 64 MB. Large allocations (zoning) may fail soon.');
+    end
+
+    local h, hf = v.handles, v.first_handles;
+    if (h ~= nil) then
+        local function c(k) return h[k] and ('%d (%+d)'):fmt(h[k], h[k] - (hf[k] or h[k])) or '-'; end
+        local htr = v.h_trend;
+        local hcol = (htr ~= nil and htr.n >= VM_MIN_N and htr.slope >= 5 and htr.r2 >= LEAK_R2) and COL_WARN or COL_HDR;
+        imgui.TextColored(hcol, ('Handles %s   GDI %s   USER %s%s'):fmt(c('handles'), c('gdi'), c('user'),
+            (htr ~= nil and htr.n >= VM_MIN_N) and ('   handles %+.1f/min'):fmt(htr.slope) or ''));
+        if (imgui.IsItemHovered()) then
+            imgui.SetTooltip('Changes are since perfmon loaded. Handles that climb steadily point at files, events,\nthreads or sockets that are opened and never closed.');
+        end
+    end
+end
+
+--[[
+* Snapshot / diff. Both ask every instrumented addon to collect garbage first ('/perf gc'),
+* force a fresh process + address-space sample, then capture 3 s later.
+--]]
+local CAPTURE_DELAY_US = 3 * 1000000;
+
+local function copy(t)
+    if (t == nil) then return nil; end
+    local r = {};
+    for k, v in pairs(t) do r[k] = v; end
+    return r;
+end
+
+request_capture = function (kind)
+    if (pm.capture ~= nil) then
+        print('[perfmon] a capture is already running.');
+        return;
+    end
+    if (kind == 'diff' and pm.snap == nil) then
+        print('[perfmon] no snapshot yet. Use /perfmon snap first.');
+        return;
+    end
+    AshitaCore:GetChatManager():QueueCommand(-1, '/perf gc');
+    pm.vm.at, pm.proc.at = 0, 0;
+    pm.capture = { kind = kind, at = now_us() + CAPTURE_DELAY_US };
+    print(('[perfmon] %s: collecting garbage in instrumented addons, capturing in 3 s...'):fmt(kind == 'snap' and 'snapshot' or 'diff'));
+end
+
+local function capture_state()
+    local s = { t = now_us(), clock = os.date('%H:%M:%S'), proc = pm.proc.kb, vm = copy(pm.vm.last), h = copy(pm.vm.handles), addons = {} };
+    for n, a in pairs(pm.addons) do
+        s.addons[n] = { mem = a.mem, base = a.base, obj = copy(a.obj) };
+    end
+    return s;
+end
+
+local function build_diff(a, b)
+    local lines = {};
+    local function add(col, txt) lines[#lines + 1] = { col = col, txt = txt }; end
+    local mins = (b.t - a.t) / 60000000;
+    add(COL_HEAD, ('Since snapshot at %s (%s ago):'):fmt(a.clock, fmt_dur(mins)));
+
+    local function mbd(x, y) return (x ~= nil and y ~= nil) and ((y - x) / 1024) or nil; end
+    local pd = mbd(a.proc, b.proc);
+    if (pd ~= nil) then
+        add(math.abs(pd) >= 20 and (pd > 0 and COL_WARN or COL_OK) or COL_HDR,
+            ('  Process private %.0f -> %.0f MB (%+.0f MB)'):fmt(a.proc / 1024, b.proc / 1024, pd));
+    end
+    if (a.vm ~= nil and b.vm ~= nil) then
+        local parts = {};
+        for _, k in ipairs({ 'private', 'mapped', 'image', 'reserved' }) do
+            local d = (b.vm[k] - a.vm[k]) / 1024;
+            if (math.abs(d) >= 1) then parts[#parts + 1] = ('%s %+.0f'):fmt(k, d); end
+        end
+        add(COL_HDR, ('  Native MB: %s'):fmt(#parts > 0 and table.concat(parts, ', ') or 'no change'));
+        local fl = (b.vm.free_largest - a.vm.free_largest) / 1024;
+        add(fl <= -20 and COL_WARN or COL_HDR, ('  Address space free %+.0f MB, largest gap %.0f -> %.0f MB'):fmt(
+            (b.vm.free_total - a.vm.free_total) / 1024, a.vm.free_largest / 1024, b.vm.free_largest / 1024));
+    end
+    if (a.h ~= nil and b.h ~= nil) then
+        local parts = {};
+        for _, k in ipairs({ 'handles', 'gdi', 'user' }) do
+            if (a.h[k] ~= nil and b.h[k] ~= nil) then parts[#parts + 1] = ('%s %+d'):fmt(k, b.h[k] - a.h[k]); end
+        end
+        add(COL_HDR, '  ' .. table.concat(parts, ', '));
+    end
+
+    -- Per addon: after-GC memory and live objects, biggest changes first.
+    local rows = {};
+    local names = {};
+    for n in pairs(a.addons) do names[n] = true; end
+    for n in pairs(b.addons) do names[n] = true; end
+    for n in pairs(names) do
+        local x, y = a.addons[n], b.addons[n];
+        if (x == nil) then
+            rows[#rows + 1] = { score = 1e9, col = COL_HEAD, txt = ('  %s: loaded since the snapshot'):fmt(n) };
+        elseif (y == nil) then
+            rows[#rows + 1] = { score = 1e9, col = COL_HEAD, txt = ('  %s: gone since the snapshot'):fmt(n) };
+        else
+            local kb = (x.base ~= nil and y.base ~= nil) and (y.base - x.base) or nil;
+            local od, parts = 0, {};
+            if (x.obj ~= nil and y.obj ~= nil) then
+                for _, k in ipairs({ { 'fonts', 'fonts' }, { 'prims', 'primitives' }, { 'com', 'textures' } }) do
+                    local d = y.obj[k[1]] - x.obj[k[1]];
+                    if (d ~= 0) then parts[#parts + 1] = ('%+d %s'):fmt(d, k[2]); od = od + d; end
+                end
+            end
+            local score = math.abs(kb or 0) + math.abs(od) * 200;
+            if (score > 0) then
+                local col = (od > 0 or (kb or 0) >= 200) and COL_WARN or COL_HDR;
+                rows[#rows + 1] = { score = score, col = col, txt = ('  %s: after-GC %s%s'):fmt(n,
+                    kb and ('%+d KB'):fmt(kb) or '?', #parts > 0 and ('; ' .. table.concat(parts, ', ')) or '') };
+            end
+        end
+    end
+    table.sort(rows, function (p1, p2) return p1.score > p2.score; end);
+    if (#rows == 0) then
+        add(COL_OK, '  No instrumented addon changed its Lua memory or object counts.');
+    end
+    for i, r in ipairs(rows) do
+        if (i > 15) then add(COL_STALE, ('  ...and %d more'):fmt(#rows - 15)); break; end
+        add(r.col, r.txt);
+    end
+    return lines;
+end
+
+capture_tick = function (t)
+    local c = pm.capture;
+    if (c == nil or t < c.at) then
+        return;
+    end
+    pm.capture = nil;
+    local s = capture_state();
+    if (c.kind == 'snap') then
+        pm.snap, pm.diff = s, nil;
+        print(('[perfmon] snapshot taken at %s (%.0f MB private). Do the thing you want to test, then /perfmon diff.'):fmt(
+            s.clock, (s.proc or 0) / 1024));
+        add_event('mark', 'snapshot');
+    else
+        pm.diff = build_diff(pm.snap, s);
+        for _, l in ipairs(pm.diff) do
+            print('[perfmon] ' .. l.txt);
+        end
+        add_event('mark', 'diff');
+    end
+end
+
+draw_snapshot = function ()
+    imgui.Spacing();
+    if (pm.capture ~= nil) then
+        imgui.TextDisabled('Capturing...');
+    else
+        if (imgui.SmallButton('Snapshot')) then request_capture('snap'); end
+        imgui.SameLine();
+        if (pm.snap ~= nil) then
+            if (imgui.SmallButton('Diff vs snapshot')) then request_capture('diff'); end
+            imgui.SameLine();
+            imgui.TextDisabled(('snapshot %s, %s ago'):fmt(pm.snap.clock, fmt_dur((now_us() - pm.snap.t) / 60000000)));
+        else
+            imgui.TextDisabled('Take a snapshot, do something (zone 5 times, open a menu...), then Diff.');
+        end
+    end
+    if (pm.diff ~= nil) then
+        if (imgui.CollapsingHeader('Last diff', ImGuiTreeNodeFlags_DefaultOpen)) then
+            for _, l in ipairs(pm.diff) do
+                imgui.TextColored(l.col, l.txt);
+            end
+            if (imgui.SmallButton('Clear diff')) then pm.diff = nil; end
+        end
+    end
+end
+
 local function draw_memory()
     local p = pm.proc;
     local any_leak = false;
@@ -1342,7 +1651,11 @@ local function draw_memory()
             imgui.PlotLines('##pm_proc', p.plot, #p.plot, 0, 'process MB (every 10s)', p.lo, p.hi, { -1, 50 });
             draw_event_markers(p);
         end
-        if (p.rising and not any_leak) then
+        if (p.rising and not any_leak and #obj_risers() > 0) then
+            imgui.PushStyleColor(ImGuiCol_Text, COL_BAD);
+            imgui.TextWrapped(('Process memory is rising and these addons keep creating objects they never destroy: %s. That is the likely leak.'):fmt(table.concat(obj_risers(), ', ')));
+            imgui.PopStyleColor();
+        elseif (p.rising and not any_leak) then
             imgui.PushStyleColor(ImGuiCol_Text, COL_WARN);
             imgui.TextWrapped('Process memory is rising but no addon\'s Lua memory is. Likely native: FFI allocations, textures/fonts not released, or the game itself (zoning also loads data). Check the markers below: a jump right after a zone or an addon load points at the cause.');
             imgui.PopStyleColor();
@@ -1351,13 +1664,16 @@ local function draw_memory()
     end
 
     imgui.Separator();
+    draw_native();
+    draw_snapshot();
+    imgui.Separator();
 
     -- Per-addon Lua baselines
     for i = #sorted, 1, -1 do sorted[i] = nil; end
     for _, a in pairs(pm.addons) do sorted[#sorted + 1] = a; end
     table.sort(sorted, cmp_mem);
 
-    if (imgui.BeginTable('##pm_mem', 7, TABLE_FLAGS, { 0, -60 })) then
+    if (imgui.BeginTable('##pm_mem', 8, TABLE_FLAGS, { 0, -60 })) then
         imgui.TableSetupScrollFreeze(0, 1);
         for i, name in ipairs(MEM_COLS) do
             imgui.TableSetupColumn(name, ImGuiTableColumnFlags_WidthStretch, MEM_W[i]);
@@ -1380,6 +1696,7 @@ local function draw_memory()
                 imgui.SetTooltip(('Declared expected growth: %s%s'):fmt(a.expect_note,
                     (a.expect_max or 0) > 0 and ('\nFlagged if after-GC memory passes %d KB.'):fmt(a.expect_max) or ''));
             end
+            imgui.TableNextColumn(); draw_obj_cell(a);
             imgui.TableNextColumn();
             if (#a.base_plot >= 2) then
                 imgui.PlotLines('##pm_b_' .. a.name, a.base_plot, #a.base_plot, 0, '', a.lo, a.hi, { -1, 18 });
@@ -1584,6 +1901,10 @@ local function print_mem()
             mb('private'), mb('private_big'), mb('mapped'), mb('image'), mb('reserved')));
         print(('[perfmon] address space: largest free gap %s, free total %s, %d regions (scan %.1f ms)'):fmt(
             mb('free_largest'), mb('free_total'), r.regions, v.scan_us / 1000));
+        local eta = vm_eta();
+        if (eta ~= nil) then
+            print(('[perfmon] free address space shrinking %.1f MB/min: runs out in about %s'):fmt(-v.free_trend.slope, fmt_dur(eta)));
+        end
     end
     if (v.handles ~= nil) then
         local h, f = v.handles, v.first_handles;
@@ -1593,8 +1914,10 @@ local function print_mem()
     for _, a in pairs(pm.addons) do
         local st = addon_status(a);
         local tr = a.trend;
-        print(('  %-16s now %6d KB  after GC %6s KB  %s  %s'):fmt(a.name, a.mem, a.base and tostring(a.base) or '-',
-            tr and ('%+.1f KB/min (fit %.2f)'):fmt(tr.slope, tr.r2) or '', st));
+        local o = a.obj;
+        print(('  %-16s now %6d KB  after GC %6s KB  %s  %s%s'):fmt(a.name, a.mem, a.base and tostring(a.base) or '-',
+            tr and ('%+.1f KB/min (fit %.2f)'):fmt(tr.slope, tr.r2) or '', st,
+            o and ('  objects %d font / %d prim / %d tex%s'):fmt(o.fonts, o.prims, o.com, a.obj_rising and ' RISING' or '') or ''));
     end
 end
 
@@ -1605,6 +1928,8 @@ local function print_help()
     print('[perfmon] /perfmon reset - clear all collected data');
     print('[perfmon] /perfmon print - summary to chat');
     print('[perfmon] /perfmon mem - memory / leak-check summary to chat');
+    print('[perfmon] /perfmon snap - snapshot memory, address space, handles and objects');
+    print('[perfmon] /perfmon diff - what changed since the snapshot');
     print('[perfmon] /perfmon mark [text] - put a marker on the process memory graph');
     print('[perfmon] /perfmon install <addon> - add auto-instrumentation to a loaded addon (edits its .lua, makes .perfbak backup, reloads it)');
     print('[perfmon] /perfmon remove <addon> - take it back out and reload');
@@ -1627,6 +1952,11 @@ ashita.events.register('command', 'perfmon_command', function (e)
     end
 
     local args = c:args();
+    -- '/perf gc' is for the perf.lua instances; make sure it never reaches the game.
+    if (#args >= 2 and args[1]:lower() == '/perf' and args[2]:lower() == 'gc') then
+        e.blocked = true;
+        return;
+    end
     if (#args == 0 or args[1]:lower() ~= '/perfmon') then
         return;
     end
@@ -1647,7 +1977,15 @@ ashita.events.register('command', 'perfmon_command', function (e)
         pm.proc.hist, pm.proc.plot, pm.proc.trend, pm.proc.rising, pm.proc.warned = {}, {}, nil, false, false;
         pm.proc.peak = pm.proc.kb or 0;
         pm.events = {};
+        pm.vm.free_hist, pm.vm.free_trend, pm.vm.h_hist, pm.vm.h_trend = {}, nil, {}, nil;
+        pm.vm.first, pm.vm.first_handles = pm.vm.last, pm.vm.handles;
+        for _, a in pairs(pm.addons) do a.obj_first = a.obj; end
+        pm.snap, pm.diff = nil, nil;
         print('[perfmon] reset.');
+    elseif (sub == 'snap' or sub == 'snapshot') then
+        request_capture('snap');
+    elseif (sub == 'diff') then
+        request_capture('diff');
     elseif (sub == 'mark') then
         local text = table.concat(args, ' ', 3);
         add_event('mark', text ~= '' and text or 'mark');
@@ -1688,6 +2026,7 @@ ashita.events.register('d3d_present', 'perfmon_present', function ()
     frame_tick(t);
     proc_tick(t);
     vm_tick(t);
+    capture_tick(t);
     refresh_others(t);
     draw();
 

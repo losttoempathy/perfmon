@@ -152,6 +152,14 @@ Uninstrumented addons are listed at the bottom.
 | expected | Rising, but the addon declared that growth with `perf.expect_growth`. Hover to see its note. |
 | **OVER CAP** | The addon declared expected growth, but its after-GC memory passed the cap it gave. |
 
+**Address space** (under the graph): how much of the game's address space is used and free, and the largest free gap. FFXI is a 32-bit program, so it crashes when no gap is big enough for an allocation, often before memory looks full. When free space shrinks steadily, perfmon estimates how long until it runs out at the current rate. Hover for the private / mapped / image / reserved breakdown. The line below shows handle, GDI and USER object counts and how much they changed since perfmon loaded.
+
+**Objects column:** live fonts + primitives + textures each addon holds, with the change since perfmon first saw it. It turns red when the count rises steadily (at least 10 objects, 1+ per minute, good fit over 10 minutes): the addon creates objects and never destroys them. That is a native leak that Lua memory can't show. Hover for the breakdown and how many of each were created in total. Shows `-` for addons using an older `perf.lua`.
+
+What is counted: fonts from `fonts.lua` and primitives from `primitives.lua` (both libraries keep every live object until `:destroy()`), and COM objects wrapped with `d3d8.gc_safe_release` (usually textures), until the garbage collector releases them. Objects made directly through `AshitaCore`'s font/primitive managers, other font libraries such as gdifonts, and textures released by hand aren't seen.
+
+**Snapshot / Diff:** click **Snapshot**, do the thing you suspect (zone five times, open a menu 50 times, reload an addon), then click **Diff vs snapshot**. Both first tell every instrumented addon to collect garbage, then capture 3 s later, so the numbers are clean. The diff lists the change in process memory, native memory by type, address space, handles, and each addon's after-GC memory and objects, biggest changes first. It's also printed to chat.
+
 ### Install tab
 
 Click the Addon, Status or Reporting header to sort by it (A-Z by default).
@@ -192,6 +200,9 @@ You get one chat message when something is first flagged. `/perfmon mem` prints 
 | `/perfmon reset` | Clear all collected data. |
 | `/perfmon print` | Timing summary to chat. |
 | `/perfmon mem` | Memory / leak summary to chat. |
+| `/perfmon snap` | Snapshot memory, address space, handles and per-addon objects. |
+| `/perfmon diff` | Show what changed since the snapshot. |
+| `/perfmon mark [text]` | Put a marker on the process memory graph. |
 | `/perfmon install <addon>` | Instrument a loaded addon (backup + reload). |
 | `/perfmon remove <addon>` | Remove instrumentation (reload). |
 | `/perfmon install all` | Instrument every loaded addon that isn't already (backup + reload each). |
@@ -208,6 +219,7 @@ You get one chat message when something is first flagged. `/perfmon mem` prints 
 | `/perf <addon> print` | Print its stats to chat. |
 | `/perf <addon> reset` | Reset its stats. |
 | `/perf <addon> on\|off` | Turn its timing on or off. |
+| `/perf gc` | Every instrumented addon collects garbage and reports a fresh baseline now (perfmon sends this for snapshots). |
 
 ---
 
@@ -227,6 +239,7 @@ time,addon,section,calls,avg_us,max_us,ms_per_s,mem_kb
 | `(game),process_private` | Game process private memory in KB (every 10 s). |
 | `(game),platform:<text>` | First row of each log: `windows`, or `wine <version> on <OS> <kernel>` under Wine/Proton. |
 | `(event),<kind>:<label>` | A marker: `zone:<zone name>`, `load:<addon>`, `unload:<addon>` or `mark:<text>`. `mem_kb` = process private memory at that moment. |
+| `<addon>,(objects)` | Once a minute: live fonts, primitives and textures in the calls / avg / max columns, total in `mem_kb`. |
 | `(game),vm_private` | Committed private memory (heaps, VirtualAlloc) in KB, every 30 s. |
 | `(game),vm_private_big` | The part of `vm_private` in regions of 1 MB or more (large buffers, texture copies). Growth in the rest = many small allocations. |
 | `(game),vm_mapped` | Committed mapped memory (shared sections, file mappings) in KB. Graphics layers often allocate here. |
